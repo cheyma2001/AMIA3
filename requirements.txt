@@ -7,5 +7,5 @@ sentence-transformers
 openpyxl
 xlsxwriter
 python-dotenv
-Oracledb
+oracledb
 
