@@ -3,7 +3,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import os
 load_dotenv()
-def get_oracle_connection()
+def get_oracle_connection():
     username = os.getenv('ORACLE_USERNAME')
     password = os.getenv('ORACLE_PASSWORD')
     dsn = os.getenv('ORACLE_DSN')
@@ -90,3 +90,4 @@ def fetch_table_structure_by_mpd(mpd_label):
     connection.close()
 
     return pd.DataFrame(rows, columns=columns)
+
