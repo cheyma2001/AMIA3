@@ -1,12 +1,8 @@
 streamlit
 pandas
 numpy
-scikit-learn
-scipy
 xgboost
-sentence-transformers
-torch
-torchvision==0.17.2
+scikit-learn
 openpyxl
 XlsxWriter
 python-dotenv
