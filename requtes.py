@@ -4,10 +4,9 @@ from dotenv import load_dotenv
 import os
 load_dotenv()
 def get_oracle_connection():
-    username = os.getenv('ORACLE_USERNAME')
-    password = os.getenv('ORACLE_PASSWORD')
+    oracledb.init_oracle_client()
     dsn = os.getenv('ORACLE_DSN')
-    return oracledb.connect(user=username, password=password, dsn=dsn)
+    return oracledb.connect(dsn=dsn)
 
 def fetch_oracle_labels(table_names):
     connection = get_oracle_connection()
@@ -88,6 +87,4 @@ def fetch_table_structure_by_mpd(mpd_label):
     rows = cursor.fetchall()
     cursor.close()
     connection.close()
-
     return pd.DataFrame(rows, columns=columns)
-
