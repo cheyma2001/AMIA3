@@ -1,2 +1,55 @@
 SELECT A.OWNER, A.TABLE_NAME FROM all_tables@PSID11G A WHERE A.table_name = 'CRE_CRDT' ORDER BY A.OWNER ASC FETCH FIRST 1 ROW ONLY; 
 SELECT A.OWNER, A.TABLE_NAME FROM all_tables@PSID11G A WHERE A.table_name in ( 'CRE_CRDT' , 'CRDT') ORDER BY A.OWNER ASC FETCH FIRST 1 ROW ONLY;
+
+
+
+
+
+
+*****************************************************************************
+
+Voici un résumé clair de l’utilisation des requêtes et fonctions de requtes.py dans app.py :
+
+Fonctions SQL dans requtes.py :
+fetch_oracle_labels(table_names)
+→ Récupère les libellés Oracle pour une liste de tables.
+
+fetch_mpd_labels()
+→ Récupère tous les libellés de MPD (modèles de données).
+
+fetch_table_structure_by_mpd(mpd_label)
+→ Récupère la structure des tables d’un MPD donné (avec owner codé en dur actuellement).
+
+Utilisation dans app.py :
+fetch_mpd_labels()
+→ Sert à remplir la liste déroulante pour choisir un MPD dans l’interface Streamlit.
+
+fetch_table_structure_by_mpd(selected_mpd)
+→ Sert à charger la structure des tables du MPD sélectionné par l’utilisateur.
+→ Le DataFrame retourné est ensuite prétraité et utilisé pour la prédiction des types de tables (FAIT/DIMENSION).
+
+fetch_oracle_labels(list(incertains["Table_Name"]))
+→ Sert à afficher les libellés Oracle pour les tables incertaines (celles dont la prédiction n’est pas sûre).
+
+En résumé :
+L’utilisateur choisit un MPD → on récupère ses tables via fetch_table_structure_by_mpd.
+On prédit le type de chaque table (FAIT/DIMENSION) et on affiche les résultats.
+Pour les cas incertains, on affiche les libellés Oracle via fetch_oracle_labels.
+Si tu veux repartir de zéro, il faut :
+
+Revoir la logique pour récupérer l’owner des tables du MPD (pour fiabiliser la requête principale).
+Adapter la fonction fetch_table_structure_by_mpd pour qu’elle soit universelle.
+Veux-tu que je propose une nouvelle version de la fonction qui gère correctement l’owner ?
+
+la j ai fixé le owner comme vous pouvez le voir RODS3 mois je voudrais pas faire ca
+parce que les listes des mpd suite a la requetes qui est afficher dans mpd les tables du mpd n ont pas toujours le meme owner
+ce que j ai comme autre requetes :
+SELECT A.OWNER, A.TABLE_NAME
+FROM all_tables@PSID11G A
+WHERE A.table_name = 'CRE_CRDT'
+ORDER BY A.OWNER ASC
+FETCH FIRST 1 ROW ONLY;
+MAIS C EST ATRAVERS une table du mpd que je pourrais avoir l owner
+comment resoudre ceci
+
+**************************************************
