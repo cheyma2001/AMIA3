@@ -53,3 +53,92 @@ MAIS C EST ATRAVERS une table du mpd que je pourrais avoir l owner
 comment resoudre ceci
 
 **************************************************
+
+def fetch_table_structure_by_mpd(mpd_label: str) -> pd.DataFrame:
+    """
+    Retourne la structure des tables d’un MPD sans owner en dur.
+    - Choix d’owner par table = nb de colonnes DESC, puis owner (alpha) en tie-break.
+    - Ajoute OWNER_CHOISI au résultat pour visibilité.
+    """
+    connection = get_oracle_connection()
+    cursor = connection.cursor()
+
+    query = """
+    WITH mpd_tables AS (
+      SELECT DISTINCT UPPER(TRIM(DICO_TABLE.CODE_OBJT_TABL)) AS TABLE_NAME
+      FROM MTDO.MTDO_DICT_TABL@psid11g DICO_TABLE
+      JOIN MTDO.MTDO_DICT_MODL@psid11g DICO_MPD
+        ON DICO_TABLE.IDNT_MODL_TABL = DICO_MPD.IDNT_OBJT_MODL
+      WHERE DICO_MPD.LIBL_OBJT_MODL LIKE :mpd_label
+    ),
+    candidates AS (
+      SELECT at.owner, at.table_name
+      FROM all_tables@psid11g at
+      JOIN mpd_tables mt
+        ON at.table_name = mt.table_name
+    ),
+    col_counts AS (
+      SELECT owner, table_name, COUNT(*) AS cnt
+      FROM all_tab_columns@psid11g
+      GROUP BY owner, table_name
+    ),
+    owner_choice AS (
+      SELECT c.owner,
+             c.table_name,
+             ROW_NUMBER() OVER (
+               PARTITION BY c.table_name
+               ORDER BY NVL(cc.cnt, 0) DESC, c.owner
+             ) AS rn
+      FROM candidates c
+      LEFT JOIN col_counts cc
+        ON cc.owner = c.owner AND cc.table_name = c.table_name
+    ),
+    picked AS (
+      SELECT owner, table_name
+      FROM owner_choice
+      WHERE rn = 1
+    )
+    SELECT
+      p.owner      AS OWNER_CHOISI,
+      a.table_name AS LIBELLE_DU_SEGMENT,
+      a.table_name AS NORME_AFNOR_ET_ADD,
+      ' '          AS DESCRIPTION_DU_SEGMENT,
+      ' '          AS CODE_PROJET,
+      a.column_name AS NOM_EPURE_DE_LA_RUBRIQUE,
+      a.column_name AS NOM_DE_LA_COLONNE_NORME_ADD,
+      ' '           AS DESCRIPTION_RUBRIQUE,
+      CASE
+        WHEN a.data_type = 'NUMBER' AND a.data_scale > 0
+          THEN a.data_type || '(' || a.data_precision || ',' || a.data_scale || ')'
+        WHEN a.data_type = 'NUMBER'
+          THEN a.data_type || '(' || a.data_precision || ')'
+        WHEN a.data_type LIKE 'TIMESTAMP%' THEN a.data_type
+        WHEN a.data_type LIKE '%INTERVAL%' THEN a.data_type
+        WHEN a.data_type IN ('CLOB','BLOB','DATE','ROWID') THEN a.data_type
+        ELSE a.data_type || '(' || a.data_length || ')'
+      END AS TYPE_DONNEES_COLONNE,
+      CASE WHEN pk_cols.COLUMN_NAME IS NOT NULL THEN 'O' ELSE 'N' END AS PK
+    FROM all_tab_columns@psid11g a
+    JOIN picked p
+      ON a.owner = p.owner AND a.table_name = p.table_name
+    LEFT JOIN (
+      SELECT cc.OWNER, cc.TABLE_NAME, cc.COLUMN_NAME
+      FROM all_cons_columns@psid11g cc
+      JOIN all_constraints@psid11g  c
+        ON cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+       AND cc.OWNER           = c.OWNER
+      WHERE c.constraint_type IN ('P','U')  -- <- mets '=' 'P' si tu veux PK strict uniquement
+    ) pk_cols
+      ON a.owner = pk_cols.OWNER
+     AND a.table_name = pk_cols.TABLE_NAME
+     AND a.column_name = pk_cols.COLUMN_NAME
+    ORDER BY a.table_name, a.column_id
+    """
+
+    cursor.execute(query, [f"%{mpd_label}%"])
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return pd.DataFrame(rows, columns=columns)
+
