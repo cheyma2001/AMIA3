@@ -142,3 +142,41 @@ def fetch_table_structure_by_mpd(mpd_label: str) -> pd.DataFrame:
     connection.close()
     return pd.DataFrame(rows, columns=columns)
 
+
+
+
+
+
+
+
+
+
+
+
+
+SELECT 
+    min(v.referenced_owner) AS owner,
+    n.LIBL_OBJT_MODL
+FROM
+    MTDO.MTDO_DICT_TABL m
+    JOIN MTDO.MTDO_DICT_MODL n ON m.IDNT_MODL_TABL = n.IDNT_OBJT_MODL
+    JOIN all_dependencies v ON m.code_objt_tabl = v.referenced_name
+GROUP BY 
+    n.LIBL_OBJT_MODL;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
