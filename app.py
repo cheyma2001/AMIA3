@@ -11,6 +11,9 @@ from sklearn.metrics import accuracy_score
 import xgboost, sklearn
 from requtes import fetch_oracle_labels,fetch_mpd_labels,fetch_table_structure_by_mpd
 
+# === NOUVEAU : page en pleine largeur ===
+st.set_page_config(layout="wide")
+
 # =========================
 # ÉTAT SESSION (confirmations utilisateur)
 # =========================
@@ -306,7 +309,7 @@ mpd_labels = fetch_mpd_labels()
 
 # Champ de recherche avec autocomplétion
 selected_mpd = st.selectbox(
-    "Sélectionner un MPD (modèle de données) :",
+    "Sélectionner un MPD (modèle de données) :",
     options=mpd_labels,
     index=None,
     placeholder="Commencez à saisir le libellé..."
@@ -379,21 +382,20 @@ if selected_mpd:
         })
         st.dataframe(styled_results, use_container_width=True)
 
-        # ============
-        # CAS INCERTAINS (NOUVEL AFFICHAGE — simplifié)
-        # ============
+        # ============ CAS INCERTAINS ============
         if not incertains.empty:
             st.subheader("Cas incertains à valider par un expert")
             oracle_labels = fetch_oracle_labels(list(incertains["Table_Name"]))
 
+            # === MODIFIÉ : plus de troncature, plus de limite de 10 ===
             def _preview_cols(table_name: str) -> str:
                 cols_arr = grouped.loc[grouped['Table_Name'] == table_name, 'Column_Names'].values
                 if len(cols_arr) == 0 or not cols_arr[0]:
                     return "Aucune colonne disponible"
                 lst = list(cols_arr[0])
-                lst = [str(col)[:30] + ('...' if len(str(col)) > 30 else '') for col in lst]
-                preview = '\n'.join([f"• {col}" for col in lst[:10]])
-                return preview + ('\n• ...' if len(lst) > 10 else '')
+                # Afficher toutes les colonnes, sans couper
+                preview = '\n'.join(f"• {col}" for col in lst)
+                return preview
 
             inc_view = pd.DataFrame({
                 "Nom table": incertains["Table_Name"].values,
@@ -416,23 +418,12 @@ if selected_mpd:
                 for t in incertains["Table_Name"]
             ]
 
-            inc_view["Note"] = [
-                "\n".join(oracle_labels.get(t, [])) if t in oracle_labels else "Aucune note trouvée"
-                for t in incertains["Table_Name"]
-            ]
-
-            # Filtre par nom (uniquement)
-            q = st.text_input("Filtrer par nom de table", "")
-            filtered = inc_view.copy()
-            if q:
-                filtered = filtered[filtered["Nom table"].str.contains(q, case=False, na=False)]
-
-            # Ajouter un style CSS pour améliorer l'affichage des colonnes
+            # === MODIFIÉ : CSS avec largeur plus grande pour éviter l'écrasement ===
             st.markdown("""
                 <style>
                 .stDataFrame [data-testid="stTable"] td {
                     white-space: pre-wrap !important;
-                    max-width: 300px;
+                    max-width: 900px;  /* élargi (au lieu de 300px) */
                     word-wrap: break-word;
                 }
                 </style>
@@ -441,10 +432,11 @@ if selected_mpd:
             # Édition dans un formulaire : validation en une fois
             with st.form("form_incertains"):
                 edited = st.data_editor(
-                    filtered,
+                    inc_view,
                     hide_index=True,
                     use_container_width=True,
-                    disabled=["Nom table", "P(FAIT)", "P(DIM)", "Colonnes ", "Note"],
+                    # === MODIFIÉ : corrige "Colonnes " -> "Colonnes" ===
+                    disabled=["Nom table", "P(FAIT)", "P(DIM)", "Colonnes", "Note"],
                     column_config={
                         "P(FAIT)": st.column_config.NumberColumn(
                             "P(FAIT)", format="%.3f",
@@ -462,17 +454,13 @@ if selected_mpd:
                         "Colonnes": st.column_config.TextColumn(
                             "Colonnes",
                             width="large",
-                            help="Aperçu des colonnes de la table (jusqu'à 10, tronquées si longues)."
+                            help="Toutes les colonnes de la table."
                         ),
+                        # === MODIFIÉ : garder une seule config 'Note' ===
                         "Note": st.column_config.TextColumn(
                             "Note",
                             width="large",
                             help="Libellés Oracle associés à la table."
-                        ),
-                        "Note": st.column_config.TextColumn(
-                            "Note",
-                            width="large",
-                            help="Note associée à la table (issue d'Oracle)."
                         ),
                     },
                 )
@@ -545,7 +533,7 @@ if selected_mpd:
         )
 
 # =========================
-# SIDEBAR DEBUG
+# SIDEBAR DEBUG (laissé commenté)
 # =========================
 # if st.sidebar.button("Afficher les features du modèle"):
 #     st.sidebar.write("**Features attendues par le modèle :**")
