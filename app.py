@@ -9,7 +9,7 @@ from xgboost import XGBClassifier
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics import accuracy_score
 import xgboost, sklearn
-from requtes import fetch_oracle_labels,fetch_mpd_labels,fetch_table_structure_by_mpd
+from requtes import fetch_oracle_labels,fetch_mpd_labels,fetch_table_structure_by_mpd, set_owner_for_mpd
 
 # =========================
 # ÉTAT SESSION (confirmations utilisateur)
@@ -313,7 +313,8 @@ selected_mpd = st.selectbox(
 )
 
 if selected_mpd:
-    df_mpd = fetch_table_structure_by_mpd(selected_mpd)
+    owner=set_owner_for_mpd(selected_mpd) 
+    df_mpd = fetch_table_structure_by_mpd(selected_mpd,owner)
     grouped, original_df = preprocess_df(df_mpd)
     if grouped is not None:
         if grouped['Table_Name'].duplicated().any():
@@ -391,12 +392,9 @@ if selected_mpd:
                 if len(cols_arr) == 0 or not cols_arr[0]:
                     return "Aucune colonne disponible"
                 lst = list(cols_arr[0])
-                # ===== CHANGEMENT MINIMAL: montrer (jusqu'à) 200 colonnes au lieu de 10 =====
-                lst = [str(col)[:30] + ('...' if len(str(col)) > 30 else '') for col in lst]
-                preview_limit = 200
-                preview = '\n'.join([f"• {col}" for col in lst[:preview_limit]])
-                return preview + ('\n• ...' if len(lst) > preview_limit else '')
-                # ==========================================================================
+                # Affiche toutes les colonnes, sans troncature
+                preview = '\n'.join([f"• {col}" for col in lst])
+                return preview
 
             inc_view = pd.DataFrame({
                 "Nom table": incertains["Table_Name"].values,
@@ -540,33 +538,3 @@ if selected_mpd:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# =========================
-# SIDEBAR DEBUG
-# =========================
-# if st.sidebar.button("Afficher les features du modèle"):
-#     st.sidebar.write("**Features attendues par le modèle :**")
-#     st.sidebar.write(load_model_features())
-
-# if st.sidebar.checkbox("Mode debug features (comparaison training)"):
-#     try:
-#         base = pd.read_csv('training_features_by_table.csv')
-#         if uploaded_file and 'grouped' in locals() and grouped is not None:
-#             sel = st.sidebar.selectbox("Table à comparer", grouped['Table_Name'])
-#             g = grouped[grouped['Table_Name'] == sel].drop(columns=['Column_Names', 'Table_Type'], errors='ignore').set_index('Table_Name')
-#             b = base[base['Table_Name'] == sel].set_index('Table_Name')
-#             if b.empty:
-#                 st.sidebar.warning("Table absente du CSV d'entraînement.")
-#             else:
-#                 common = [c for c in g.columns if c in b.columns and c != 'Table_Type']
-#                 diff = (g[common].astype(float).round(8) - b[common].astype(float).round(8)).T
-#                 st.sidebar.write("Différences (app - train) ≠ 0 ⇒ drift :")
-#                 st.sidebar.dataframe(diff[diff.ne(0).any(axis=1)])
-#         else:
-#             st.sidebar.info("Charge un fichier Excel pour activer la comparaison.")
-#     except Exception as e:
-#         st.sidebar.error(f"Debug impossible : {e}")
-
-# try:
-#     st.sidebar.caption(f"xgboost: {xgboost.__version__} | sklearn: {sklearn.__version__} | pandas: {pd.__version__}")
-# except Exception:
-#     pass
