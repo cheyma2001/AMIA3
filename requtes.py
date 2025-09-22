@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 import os
 load_dotenv()
 def get_oracle_connection():
+    oracledb.init_oracle_client()
+    # username = os.getenv('ORACLE_USERNAME')
+    # password = os.getenv('ORACLE_PASSWORD')
     dsn = os.getenv('ORACLE_DSN')
     return oracledb.connect(dsn=dsn)
 
@@ -32,11 +35,37 @@ def fetch_mpd_labels():
     cursor.close()
     connection.close()
     return labels
+_CURRENT_MPD_OWNER = None
 
-def fetch_table_structure_by_mpd(mpd_label):
+def set_owner_for_mpd(mpd_label):
+    """
+    Récupère et stocke le owner associé au MPD sélectionné.
+    """
+    global _CURRENT_MPD_OWNER
     connection = get_oracle_connection()
     cursor = connection.cursor()
-    query = """
+    query = '''
+        SELECT 
+            min(v.owner) AS owner 
+        FROM
+            MTDO.MTDO_DICT_TABL@PSID11G m
+            JOIN MTDO.MTDO_DICT_MODL@PSID11G n ON m.IDNT_MODL_TABL = n.IDNT_OBJT_MODL
+            JOIN all_tables@PSID11G v ON m.code_objt_tabl = v.TABLE_NAME
+        WHERE n.LIBL_OBJT_MODL = :mpd_label
+    
+             
+    '''
+    cursor.execute(query, [mpd_label])
+    result = cursor.fetchone()
+    cursor.close()
+    connection.close()
+    _CURRENT_MPD_OWNER = result[0] if result and result[0] else None
+    return _CURRENT_MPD_OWNER
+
+def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
+    connection = get_oracle_connection()
+    cursor = connection.cursor()
+    query = f"""
     SELECT
         A.TABLE_NAME        AS LIBELLE_DU_SEGMENT,
         A.TABLE_NAME        AS NORME_AFNOR_ET_ADD,
@@ -66,12 +95,12 @@ def fetch_table_structure_by_mpd(mpd_label):
           ON cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
          AND cc.OWNER          = c.OWNER
         WHERE c.constraint_type = 'U'
-          AND c.owner = 'RODS3'
+          AND c.owner = '{current_mpd_owner}'
     ) pk_cols
       ON A.owner = pk_cols.OWNER
      AND A.table_name = pk_cols.TABLE_NAME
      AND A.column_name = pk_cols.COLUMN_NAME
-    WHERE A.owner = 'RODS3'
+    WHERE A.owner = '{current_mpd_owner}'
       AND A.table_name IN (
             SELECT UPPER(TRIM(DICO_TABLE.CODE_OBJT_TABL))
             FROM MTDO.MTDO_DICT_TABL@psid11g  DICO_TABLE
@@ -81,10 +110,10 @@ def fetch_table_structure_by_mpd(mpd_label):
       )
     ORDER BY A.table_name, A.COLUMN_ID
     """
+    
     cursor.execute(query, [f"%{mpd_label}%"])
     columns = [desc[0] for desc in cursor.description]
     rows = cursor.fetchall()
     cursor.close()
     connection.close()
     return pd.DataFrame(rows, columns=columns)
-
