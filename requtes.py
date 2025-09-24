@@ -117,3 +117,30 @@ def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
     cursor.close()
     connection.close()
     return pd.DataFrame(rows, columns=columns)
+
+
+def fetch_external_ods_relations():
+    """
+    Exécute la requête SQL pour récupérer les relations ODS (tables/colonnes) et retourne un DataFrame.
+    """
+    query = '''
+    SELECT 
+        t2.CODE_OBJT_TABL,
+        t1.CODE_OBJT_COLN
+      
+                 
+    FROM 
+        MTDO.MTDO_DICT_TABL_COLN@PSID11G t1
+    JOIN 
+        MTDO.MTDO_DICT_TABL@PSID11G t2 ON t1.IDNT_MODL = t2.IDNT_MODL_TABL
+    WHERE T1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
+    ORDER BY t2.CODE_OBJT_TABL ASC
+    '''
+    connection = get_oracle_connection()
+    cursor = connection.cursor()
+    cursor.execute(query)
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return pd.DataFrame(rows, columns=columns)
