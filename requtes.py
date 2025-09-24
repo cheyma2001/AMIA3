@@ -1,12 +1,13 @@
-import oracledb
-import pandas as pd
-from dotenv import load_dotenv
 import os
+import pandas as pd
+import oracledb
+from dotenv import load_dotenv
+
 load_dotenv()
+
 def get_oracle_connection():
+    # Si besoin d’un client instantané, préciser le path dans init_oracle_client(lib_dir="...")
     oracledb.init_oracle_client()
-    # username = os.getenv('ORACLE_USERNAME')
-    # password = os.getenv('ORACLE_PASSWORD')
     dsn = os.getenv('ORACLE_DSN')
     return oracledb.connect(dsn=dsn)
 
@@ -16,10 +17,13 @@ def fetch_oracle_labels(table_names):
     results = {}
     for table in table_names:
         cursor.execute(
-            "SELECT t.CODE_OBJT_TABL, d.LIBL_DETL_DESC "
-            "FROM MTDO.MTDO_DICT_DESC@PSID11G d "
-            "JOIN MTDO.MTDO_DICT_TABL@PSID11G t ON d.IDNT_OBJT_MODL_DETL = t.IDNT_DETL_DESC "
-            "WHERE t.CODE_OBJT_TABL = :table_name",
+            """
+            SELECT t.CODE_OBJT_TABL, d.LIBL_DETL_DESC
+            FROM MTDO.MTDO_DICT_DESC@PSID11G d
+            JOIN MTDO.MTDO_DICT_TABL@PSID11G t 
+              ON d.IDNT_OBJT_MODL_DETL = t.IDNT_DETL_DESC
+            WHERE t.CODE_OBJT_TABL = :table_name
+            """,
             [table]
         )
         results[table] = [row[1] for row in cursor.fetchall()]
@@ -35,25 +39,26 @@ def fetch_mpd_labels():
     cursor.close()
     connection.close()
     return labels
+
 _CURRENT_MPD_OWNER = None
 
 def set_owner_for_mpd(mpd_label):
     """
     Récupère et stocke le owner associé au MPD sélectionné.
+    On prend le min(owner) retourné (façon simple pour fixer un owner principal).
     """
     global _CURRENT_MPD_OWNER
     connection = get_oracle_connection()
     cursor = connection.cursor()
     query = '''
         SELECT 
-            min(v.owner) AS owner 
-        FROM
-            MTDO.MTDO_DICT_TABL@PSID11G m
-            JOIN MTDO.MTDO_DICT_MODL@PSID11G n ON m.IDNT_MODL_TABL = n.IDNT_OBJT_MODL
-            JOIN all_tables@PSID11G v ON m.code_objt_tabl = v.TABLE_NAME
+            MIN(v.owner) AS owner 
+        FROM MTDO.MTDO_DICT_TABL@PSID11G m
+        JOIN MTDO.MTDO_DICT_MODL@PSID11G n 
+          ON m.IDNT_MODL_TABL = n.IDNT_OBJT_MODL
+        JOIN all_tables@PSID11G v 
+          ON m.code_objt_tabl = v.TABLE_NAME
         WHERE n.LIBL_OBJT_MODL = :mpd_label
-    
-             
     '''
     cursor.execute(query, [mpd_label])
     result = cursor.fetchone()
@@ -62,7 +67,11 @@ def set_owner_for_mpd(mpd_label):
     _CURRENT_MPD_OWNER = result[0] if result and result[0] else None
     return _CURRENT_MPD_OWNER
 
-def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
+def fetch_table_structure_by_mpd(mpd_label, current_mpd_owner):
+    """
+    Récupère la structure (colonnes + PK) des tables du MPD (via dictionnaire MTDO) 
+    pour l'owner détecté, au format attendu par l'app (LIBELLE_DU_SEGMENT, ... , PK).
+    """
     connection = get_oracle_connection()
     cursor = connection.cursor()
     query = f"""
@@ -87,7 +96,9 @@ def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
         CASE WHEN pk_cols.COLUMN_NAME IS NOT NULL THEN 'O' ELSE 'N' END AS PK
     FROM all_tab_columns@psid11g  A
     JOIN all_objects@psid11g  O
-      ON O.owner = A.owner AND O.object_name = A.table_name AND O.object_type = 'TABLE'
+      ON O.owner = A.owner 
+     AND O.object_name = A.table_name 
+     AND O.object_type = 'TABLE'
     LEFT JOIN (
         SELECT cc.OWNER, cc.TABLE_NAME, cc.COLUMN_NAME
         FROM all_cons_columns@psid11g  cc
@@ -110,7 +121,6 @@ def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
       )
     ORDER BY A.table_name, A.COLUMN_ID
     """
-    
     cursor.execute(query, [f"%{mpd_label}%"])
     columns = [desc[0] for desc in cursor.description]
     rows = cursor.fetchall()
@@ -118,22 +128,19 @@ def fetch_table_structure_by_mpd(mpd_label,current_mpd_owner):
     connection.close()
     return pd.DataFrame(rows, columns=columns)
 
-
 def fetch_external_ods_relations():
     """
-    Exécute la requête SQL pour récupérer les relations ODS (tables/colonnes) et retourne un DataFrame.
+    Récupère toutes les paires (table, colonne) pour le périmètre ODS côté dictionnaire MTDO.
+    On ne filtre pas par owner ici : on veut balayer tout ODS.
     """
     query = '''
     SELECT 
-        t2.CODE_OBJT_TABL,
-        t1.CODE_OBJT_COLN
-      
-                 
-    FROM 
-        MTDO.MTDO_DICT_TABL_COLN@PSID11G t1
-    JOIN 
-        MTDO.MTDO_DICT_TABL@PSID11G t2 ON t1.IDNT_MODL = t2.IDNT_MODL_TABL
-    WHERE T1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
+        t2.CODE_OBJT_TABL   AS ODS_TABLE_NAME,
+        t1.CODE_OBJT_COLN   AS ODS_COLUMN_NAME
+    FROM MTDO.MTDO_DICT_TABL_COLN@PSID11G t1
+    JOIN MTDO.MTDO_DICT_TABL@PSID11G      t2 
+      ON t1.IDNT_MODL      = t2.IDNT_MODL_TABL
+    WHERE t1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
     ORDER BY t2.CODE_OBJT_TABL ASC
     '''
     connection = get_oracle_connection()
