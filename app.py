@@ -103,42 +103,32 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
 
     def cols_for_table(t):
         subset = df[df['LIBELLE_DU_SEGMENT'] == t]
-        s = set()
+        all_cols = set()
         for c in candidate_name_cols:
-            s |= set(subset[c].dropna())
-        return s
+            all_cols |= set(subset[c].dropna())
+        # Ajoute aussi les noms normalisés pour la recherche robuste
+        all_cols_norm = set(_norm(col) for col in all_cols)
+        return all_cols, all_cols_norm
 
     table_columns = {t: cols_for_table(t) for t in all_tables}
     fact_tables = [t for t in all_tables if type_map.get(_norm(t)) == 'FAIT']
     dim_tables  = [t for t in all_tables if type_map.get(_norm(t)) == 'DIMENSION']
 
-    EXCLUDE_COLS = {"PERD_ARRT_INFO", "CODE_ORG", "CODE_ORGN_FINN"}
+    EXCLUDE_COLS = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
     relations = []
     for fact in fact_tables:
-        fact_cols = table_columns.get(fact, set())
+        fact_cols, fact_cols_norm = table_columns.get(fact, (set(), set()))
         for dim in dim_tables:
-            dim_cols = table_columns.get(dim, set())
-            # Colonnes PK de la dimension
-            pk_dim = set(
-                original_df[(original_df['LIBELLE_DU_SEGMENT'] == dim) & (original_df['PK'] == 'O')]['NOM_EPURE_DE_LA_RUBRIQUE']
-            )
-            # On ne cherche la relation que si la dimension a une PK composite ou simple
-            if pk_dim:
-                # Appliquer la regex et exclure les colonnes non souhaitées
-                pk_dim_filtered = set([
-                    col for col in pk_dim
-                    if RE_KEYS_RELATION.search(col)
-                    and col not in EXCLUDE_COLS
-                ])
-                # Toutes les colonnes PK filtrées doivent être présentes dans la table de fait
-                pk_dim_in_fact = [col for col in pk_dim_filtered if col in fact_cols]
-                if set(pk_dim_in_fact) == pk_dim_filtered and pk_dim_filtered:
-                    relations.append({
-                        'Table_Fact': fact,
-                        'Table_Dimension': dim,
-                        'Colonnes_Communes': ', '.join(sorted(pk_dim_in_fact)),
-                        'Nb_Colonnes_Communes': len(pk_dim_in_fact)
-                    })
+            dim_cols, dim_cols_norm = table_columns.get(dim, (set(), set()))
+            # Intersection brute de toutes les colonnes (pas seulement PK), en ignorant les colonnes à exclure
+            common_cols = sorted([col for col in (fact_cols & dim_cols) if col not in EXCLUDE_COLS])
+            if common_cols:
+                relations.append({
+                    'Table_Fact': fact,
+                    'Table_Dimension': dim,
+                    'Colonnes_Communes': ', '.join(common_cols),
+                    'Nb_Colonnes_Communes': len(common_cols)
+                })
     return pd.DataFrame(relations)
 
 # =========================
@@ -286,11 +276,24 @@ def preprocess_df(df):
 
     return grouped, df
 
-# =========================
-# UI
-# =========================
-st.title("Prédiction de type de table (FACT ou DIMENSION)")
-st.header("Tester avec un MPD Oracle")
+
+st.title("Prédiction de type de table (FAIT ou DIMENSION)")
+
+st.write("Choisissez le mode de test :")
+# Utilisation d'un switch/toggle pour le choix du mode
+if 'mode' not in st.session_state:
+    st.session_state.mode = "Sélectionner un MPD Oracle"
+
+toggle = st.toggle(
+    label="Mode MPD Oracle / Fichier Excel",
+    value=(st.session_state.mode == "Sélectionner un MPD Oracle"),
+    help="Activez pour MPD Oracle, désactivez pour Fichier Excel."
+)
+if toggle:
+    st.session_state.mode = "Sélectionner un MPD Oracle"
+else:
+    st.session_state.mode = "Charger un fichier Excel"
+mode = st.session_state.mode
 
 prob_diff_threshold = st.slider(
     "Seuil de différence de probabilité pour considérer une table comme incertaine",
@@ -301,240 +304,241 @@ prob_diff_threshold = st.slider(
     help="Si |P(FACT) - P(DIM)| < seuil, la table est considérée comme incertaine."
 )
 
-# Récupérer tous libellés les MPD 
-mpd_labels = fetch_mpd_labels()
+grouped, original_df = None, None
+results, predictions, predictions_proba = None, None, None
 
-# Champ de recherche avec autocomplétion
-selected_mpd = st.selectbox(
-    "Sélectionner un MPD (modèle de données) :",
-    options=mpd_labels,
-    index=None,
-    placeholder="Commencez à saisir le libellé..."
-)
 
-if selected_mpd:
-    owner=set_owner_for_mpd(selected_mpd) 
-    df_mpd = fetch_table_structure_by_mpd(selected_mpd,owner)
-    grouped, original_df = preprocess_df(df_mpd)
-    if grouped is not None:
-        if grouped['Table_Name'].duplicated().any():
-            st.warning("Attention : Certains noms de tables sont dupliqués.")
+if mode == "Sélectionner un MPD Oracle":
+    st.header("Tester avec un MPD Oracle")
+    mpd_labels = fetch_mpd_labels()
+    selected_mpd = st.selectbox(
+        "Sélectionner un MPD (modèle de données) :",
+        options=mpd_labels,
+        index=None,
+        placeholder="Commencez à saisir le libellé..."
+    )
+    if selected_mpd:
+        owner = set_owner_for_mpd(selected_mpd)
+        df_mpd = fetch_table_structure_by_mpd(selected_mpd, owner)
+        grouped, original_df = preprocess_df(df_mpd)
 
-        model_features = [c for c in load_model_features() if c != 'Table_Type']
+elif mode == "Charger un fichier Excel":
+    st.header("Tester avec un fichier Excel")
+    uploaded_file = st.file_uploader("Charger un fichier Excel", type=["xlsx", "xls"])
+    if uploaded_file:
+        grouped, original_df = preprocess_excel_file(uploaded_file)
 
-        X_test = grouped.copy()
-        for col in ['Table_Name', 'Table_Type', 'Column_Names']:
-            if col in X_test.columns:
-                X_test = X_test.drop(columns=col)
+# === TRAITEMENT ET AFFICHAGE COMMUN ===
+if grouped is not None:
+    if grouped['Table_Name'].duplicated().any():
+        st.warning("Attention : Certains noms de tables sont dupliqués.")
 
-        for col in model_features:
-            if col not in X_test.columns:
-                X_test[col] = 0
-        X_test = X_test[model_features].astype('float32')
+    model_features = [c for c in load_model_features() if c != 'Table_Type']
 
-        predictions = xgb_model.predict(X_test)
-        predictions_proba = xgb_model.predict_proba(X_test)
+    X_test = grouped.copy()
+    for col in ['Table_Name', 'Table_Type', 'Column_Names']:
+        if col in X_test.columns:
+            X_test = X_test.drop(columns=col)
 
-        results = pd.DataFrame({
-            'Table_Name': grouped['Table_Name'],
-            'Probabilité FACT': predictions_proba[:, 1],
-            'Probabilité DIMENSION': predictions_proba[:, 0],
-            'Type Prédit': np.where(predictions == 1, 'FAIT', 'DIMENSION'),
-            'Confiance': np.maximum(predictions_proba[:, 1], predictions_proba[:, 0]),
-            'Confirmed': False
-        })
+    for col in model_features:
+        if col not in X_test.columns:
+            X_test[col] = 0
+    X_test = X_test[model_features].astype('float32')
 
-        # Appliquer les corrections déjà confirmées
-        for table, typ in st.session_state.confirmed_types.items():
-            mask = results['Table_Name'] == table
-            if mask.any():
-                results.loc[mask, 'Type Prédit'] = typ
-                results.loc[mask, 'Confirmed'] = True
+    predictions = xgb_model.predict(X_test)
+    predictions_proba = xgb_model.predict_proba(X_test)
 
-        # Si le vrai type est présent (pour évaluer la précision)
-        if 'Table_Type' in grouped.columns:
-            results['Vrai Type'] = grouped['Table_Type'].map({1: 'FAIT', 0: 'DIMENSION'})
+    results = pd.DataFrame({
+        'Table_Name': grouped['Table_Name'],
+        'Probabilité FACT': predictions_proba[:, 1],
+        'Probabilité DIMENSION': predictions_proba[:, 0],
+        'Type Prédit': np.where(predictions == 1, 'FAIT', 'DIMENSION'),
+        'Confiance': np.maximum(predictions_proba[:, 1], predictions_proba[:, 0]),
+        'Confirmed': False
+    })
 
-        # Détection des cas incertains (diff < seuil et non confirmés)
-        incertains_mask = (
-            (np.abs(results['Probabilité FACT'] - results['Probabilité DIMENSION']) < prob_diff_threshold)
-            & (~results['Confirmed'])
-        )
-        incertains = results[incertains_mask].copy()
+    for table, typ in st.session_state.confirmed_types.items():
+        mask = results['Table_Name'] == table
+        if mask.any():
+            results.loc[mask, 'Type Prédit'] = typ
+            results.loc[mask, 'Confirmed'] = True
 
-        st.subheader("Résultats des prédictions")
+    if 'Table_Type' in grouped.columns:
+        results['Vrai Type'] = grouped['Table_Type'].map({1: 'FAIT', 0: 'DIMENSION'})
 
-        def color_row(row):
+    incertains_mask = (
+        (np.abs(results['Probabilité FACT'] - results['Probabilité DIMENSION']) < prob_diff_threshold)
+        & (~results['Confirmed'])
+    )
+    incertains = results[incertains_mask].copy()
+
+    st.subheader("Résultats des prédictions")
+
+    def color_row(row):
+            # On récupère la valeur Confirmed depuis results
+            # Si la table est confirmée (expert ou auto), on affiche en vert
+            table_name = row['Table_Name'] if 'Table_Name' in row else None
+            if table_name is not None and 'Confirmed' in results.columns:
+                confirmed = results.loc[results['Table_Name'] == table_name, 'Confirmed'].values
+                if len(confirmed) > 0 and confirmed[0]:
+                    return ['background-color: #d4edda'] * len(row)
+            # Sinon, logique habituelle
             diff = abs(row['Probabilité FACT'] - row['Probabilité DIMENSION'])
             if diff >= prob_diff_threshold:
-                return ['background-color: #d4edda'] * len(row)  # Vert clair
+                return ['background-color: #d4edda'] * len(row)
             else:
-                return ['background-color: #f8d7da'] * len(row)  # Rouge clair
+                return ['background-color: #f8d7da'] * len(row)
 
-        # On affiche tout le tableau stylé
-        results_display = results.drop(columns=['Confirmed']).copy()
-        styled_results = results_display.style.apply(color_row, axis=1).format({
-            'Probabilité FACT': '{:.3f}',
-            'Probabilité DIMENSION': '{:.3f}',
-            'Confiance': '{:.3f}'
-        })
-        st.dataframe(styled_results, use_container_width=True)
+    # On garde la colonne Confirmed pour la coloration
+    results_display = results.copy().drop(columns=['Confirmed'])
+    styled_results = results_display.style.apply(color_row, axis=1).format({
+        'Probabilité FACT': '{:.3f}',
+        'Probabilité DIMENSION': '{:.3f}',
+        'Confiance': '{:.3f}'
+    })
+    st.dataframe(styled_results, use_container_width=True)
 
-        # ============
-        # CAS INCERTAINS (NOUVEL AFFICHAGE — simplifié)
-        # ============
-        if not incertains.empty:
-            st.subheader("Cas incertains à valider par un expert")
+    if not incertains.empty:
+        st.subheader("Cas incertains à valider par un expert")
+        if mode == "Sélectionner un MPD Oracle":
             oracle_labels = fetch_oracle_labels(list(incertains["Table_Name"]))
-
-            def _preview_cols(table_name: str) -> str:
-                cols_arr = grouped.loc[grouped['Table_Name'] == table_name, 'Column_Names'].values
-                if len(cols_arr) == 0 or not cols_arr[0]:
-                    return "Aucune colonne disponible"
-                lst = list(cols_arr[0])
-                # Affiche toutes les colonnes, sans troncature
-                preview = '\n'.join([f"• {col}" for col in lst])
-                return preview
-
-            inc_view = pd.DataFrame({
-                "Nom table": incertains["Table_Name"].values,
-                "P(FAIT)": incertains["Probabilité FACT"].round(3).values,
-                "P(DIM)": incertains["Probabilité DIMENSION"].round(3).values,
-            })
-
-            default_types = []
-            for t in incertains["Table_Name"]:
-                if t in st.session_state.confirmed_types:
-                    default_types.append(st.session_state.confirmed_types[t])
-                else:
-                    default_types.append(results.loc[results["Table_Name"] == t, "Type Prédit"].iloc[0])
-            inc_view["Type proposé"] = default_types
-
-            inc_view["Colonnes"] = [_preview_cols(t) for t in incertains["Table_Name"]]
-
-            # — Garde UNE seule “Note” (évite le doublon)
-            inc_view["Note"] = [
-                "\n".join(oracle_labels.get(t, [])) if t in oracle_labels else "Aucune note trouvée"
-                for t in incertains["Table_Name"]
-            ]
-
-            # Filtre par nom (uniquement)
-            q = st.text_input("Filtrer par nom de table", "")
-            filtered = inc_view.copy()
-            if q:
-                filtered = filtered[filtered["Nom table"].str.contains(q, case=False, na=False)]
-
-            # CSS pour autoriser les retours à la ligne
-            st.markdown("""
-                <style>
-                .stDataFrame [data-testid="stTable"] td {
-                    white-space: pre-wrap !important;
-                    max-width: 300px;
-                    word-wrap: break-word;
-                }
-                </style>
-            """, unsafe_allow_html=True)
-
-            # Édition dans un formulaire : validation en une fois
-            with st.form("form_incertains"):
-                edited = st.data_editor(
-                    filtered,
-                    hide_index=True,
-                    use_container_width=True,
-                    # ===== CHANGEMENT MINIMAL: corriger le nom de colonne => "Colonnes" (sans espace) =====
-                    disabled=["Nom table", "P(FAIT)", "P(DIM)", "Colonnes", "Note"],
-                    # ======================================================================================
-                    column_config={
-                        "P(FAIT)": st.column_config.NumberColumn(
-                            "P(FAIT)", format="%.3f",
-                            help="Probabilité prédite que la table soit un FAIT."
-                        ),
-                        "P(DIM)": st.column_config.NumberColumn(
-                            "P(DIM)", format="%.3f",
-                            help="Probabilité prédite que la table soit une DIMENSION."
-                        ),
-                        "Type proposé": st.column_config.SelectboxColumn(
-                            "Type proposé",
-                            options=["DIMENSION", "FAIT"],
-                            help="Corrigez le type si besoin."
-                        ),
-                        "Colonnes": st.column_config.TextColumn(
-                            "Colonnes",
-                            width="large",
-                            help="Aperçu des colonnes de la table (beaucoup plus complet, tronqué si >200)."
-                        ),
-                        "Note": st.column_config.TextColumn(
-                            "Note",
-                            width="large",
-                            help="Note associée à la table (issue d'Oracle)."
-                        ),
-                    },
-                )
-                submitted = st.form_submit_button("Valider les modifications")
-                if submitted:
-                    for _, r in edited.iterrows():
-                        st.session_state.confirmed_types[r["Nom table"]] = r["Type proposé"]
-                    st.success("Modifications validées !")
-                    st.rerun()
         else:
-            st.info("Aucun cas incertain à valider.")
+            oracle_labels = {}
 
-        # Évaluer précision si étiquettes réelles présentes
-        if 'Table_Type' in grouped.columns and not grouped['Table_Type'].isna().all():
-            accuracy = accuracy_score(
-                grouped['Table_Type'].map({1: 1, 0: 0}),
-                results['Type Prédit'].map({'FAIT': 1, 'DIMENSION': 0})
+        def _preview_cols(table_name: str) -> str:
+            cols_arr = grouped.loc[grouped['Table_Name'] == table_name, 'Column_Names'].values
+            if len(cols_arr) == 0 or not cols_arr[0]:
+                return "Aucune colonne disponible"
+            lst = list(cols_arr[0])
+            preview = '\n'.join([f"• {col}" for col in lst])
+            return preview
+
+        inc_view = pd.DataFrame({
+            "Nom table": incertains["Table_Name"].values,
+            "P(FAIT)": incertains["Probabilité FACT"].round(3).values,
+            "P(DIM)": incertains["Probabilité DIMENSION"].round(3).values,
+        })
+
+        default_types = []
+        for t in incertains["Table_Name"]:
+            if t in st.session_state.confirmed_types:
+                default_types.append(st.session_state.confirmed_types[t])
+            else:
+                default_types.append(results.loc[results["Table_Name"] == t, "Type Prédit"].iloc[0])
+        inc_view["Type proposé"] = default_types
+
+        inc_view["Colonnes"] = [_preview_cols(t) for t in incertains["Table_Name"]]
+
+        inc_view["Note"] = [
+            "\n".join(oracle_labels.get(t, [])) if t in oracle_labels else "Aucune note trouvée"
+            for t in incertains["Table_Name"]
+        ]
+
+        q = st.text_input("Filtrer par nom de table", "")
+        filtered = inc_view.copy()
+        if q:
+            filtered = filtered[filtered["Nom table"].str.contains(q, case=False, na=False)]
+
+        st.markdown("""
+            <style>
+            .stDataFrame [data-testid="stTable"] td {
+                white-space: pre-wrap !important;
+                max-width: 300px;
+                word-wrap: break-word;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+
+        with st.form("form_incertains"):
+            edited = st.data_editor(
+                filtered,
+                hide_index=True,
+                use_container_width=True,
+                disabled=["Nom table", "P(FAIT)", "P(DIM)", "Colonnes", "Note"],
+                column_config={
+                    "P(FAIT)": st.column_config.NumberColumn(
+                        "P(FAIT)", format="%.3f",
+                        help="Probabilité prédite que la table soit un FAIT."
+                    ),
+                    "P(DIM)": st.column_config.NumberColumn(
+                        "P(DIM)", format="%.3f",
+                        help="Probabilité prédite que la table soit une DIMENSION."
+                    ),
+                    "Type proposé": st.column_config.SelectboxColumn(
+                        "Type proposé",
+                        options=["DIMENSION", "FAIT"],
+                        help="Corrigez le type si besoin."
+                    ),
+                    "Colonnes": st.column_config.TextColumn(
+                        "Colonnes",
+                        width="large",
+                        help="Aperçu des colonnes de la table (beaucoup plus complet, tronqué si >200)."
+                    ),
+                    "Note": st.column_config.TextColumn(
+                        "Note",
+                        width="large",
+                        help="Note associée à la table (issue d'Oracle)."
+                    ),
+                },
             )
-            st.write(f"**Précision sur le MPD sélectionné :** {accuracy:.4f}")
+            submitted = st.form_submit_button("Valider les modifications")
+            if submitted:
+                for _, r in edited.iterrows():
+                    st.session_state.confirmed_types[r["Nom table"]] = r["Type proposé"]
+                st.success("Modifications validées !")
+                st.rerun()
+    else:
+        st.info("Aucun cas incertain à valider.")
 
-        # Relations FACT-DIM
-        relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
-        st.subheader("Relations détectées entre tables de faits et dimensions")
-        if relations_df.empty:
-            st.info("Aucune relation détectée.")
-        else:
-            st.dataframe(relations_df, use_container_width=True)
-
-        # Journal des modifications manuelles (comparé à la prédiction initiale brute)
-        modifications_data = []
-        for table, typ in st.session_state.confirmed_types.items():
-            result_mask = results['Table_Name'] == table
-            if not result_mask.any():
-                continue
-            grouped_mask = grouped['Table_Name'] == table
-            if not grouped_mask.any():
-                continue
-            idx = grouped[grouped_mask].index[0]
-            original_prediction = 'FAIT' if predictions[idx] == 1 else 'DIMENSION'
-            if typ != original_prediction:
-                modifications_data.append({
-                    'Table_Name': table,
-                    'Type Initial': original_prediction,
-                    'Type Corrigé': typ
-                })
-        modifications_df = pd.DataFrame(modifications_data)
-
-        # Export Excel
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            # Feuille 'Predictions' = grouped + TYPE_DIMENSIONNEL_TABLE
-            predictions_sheet_df = grouped.copy()
-            type_map = dict(zip(results['Table_Name'].map(_norm), results['Type Prédit']))
-            predictions_sheet_df['TYPE_DIMENSIONNEL_TABLE'] = predictions_sheet_df['Table_Name'].map(type_map).fillna('UNKNOWN')
-            if 'TYPE_DONNEES_COLONNE' in predictions_sheet_df.columns:
-                predictions_sheet_df.rename(columns={'TYPE_DONNEES_COLONNE': 'FORMAT'}, inplace=True)
-            cols = [c for c in predictions_sheet_df.columns if c != 'TYPE_DIMENSIONNEL_TABLE'] + ['TYPE_DIMENSIONNEL_TABLE']
-            predictions_sheet_df = predictions_sheet_df.loc[:, cols]
-            predictions_sheet_df.to_excel(writer, index=False, sheet_name='Predictions')
-
-            relations_df.to_excel(writer, index=False, sheet_name='Relations_FACT_DIM')
-            if not modifications_df.empty:
-                modifications_df.to_excel(writer, index=False, sheet_name='Modifications_Manuelles')
-        output.seek(0)
-        st.download_button(
-            label="Télécharger les prédictions et relations (Excel)",
-            data=output,
-            file_name="predictions_et_relations.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if 'Table_Type' in grouped.columns and not grouped['Table_Type'].isna().all():
+        accuracy = accuracy_score(
+            grouped['Table_Type'].map({1: 1, 0: 0}),
+            results['Type Prédit'].map({'FAIT': 1, 'DIMENSION': 0})
         )
+        st.write(f"**Précision sur la source sélectionnée :** {accuracy:.4f}")
+
+    relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
+    st.subheader("Relations détectées entre tables de faits et dimensions")
+    if relations_df.empty:
+        st.info("Aucune relation détectée.")
+    else:
+        st.dataframe(relations_df, use_container_width=True)
+
+    modifications_data = []
+    for table, typ in st.session_state.confirmed_types.items():
+        result_mask = results['Table_Name'] == table
+        if not result_mask.any():
+            continue
+        grouped_mask = grouped['Table_Name'] == table
+        if not grouped_mask.any():
+            continue
+        idx = grouped[grouped_mask].index[0]
+        original_prediction = 'FAIT' if predictions[idx] == 1 else 'DIMENSION'
+        if typ != original_prediction:
+            modifications_data.append({
+                'Table_Name': table,
+                'Type Initial': original_prediction,
+                'Type Corrigé': typ
+            })
+    modifications_df = pd.DataFrame(modifications_data)
+
+    # Export Excel : structure identique à la source + colonne de prédiction
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # On part du DataFrame source original_df
+        export_df = original_df.copy()
+        # Ajout de la colonne de prédiction
+        type_map = dict(zip(results['Table_Name'].map(_norm), results['Type Prédit']))
+        export_df['TYPE_DIMENSIONNEL_TABLE'] = export_df['LIBELLE_DU_SEGMENT'].map(type_map).fillna('UNKNOWN')
+        # On place la colonne de prédiction à la fin
+        cols = [c for c in export_df.columns if c != 'TYPE_DIMENSIONNEL_TABLE'] + ['TYPE_DIMENSIONNEL_TABLE']
+        export_df = export_df.loc[:, cols]
+        export_df.to_excel(writer, index=False, sheet_name='Structure+Prédiction')
+    output.seek(0)
+    st.download_button(
+        label="Télécharger la structure + prédiction (Excel)",
+        data=output,
+        file_name="structure_et_prediction.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
