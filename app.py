@@ -6,10 +6,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from xgboost import XGBClassifier
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer  # si besoin plus tard
 from sklearn.metrics import accuracy_score
 import xgboost, sklearn
-from requtes import fetch_oracle_labels,fetch_mpd_labels,fetch_table_structure_by_mpd, set_owner_for_mpd
+
+from requtes import (
+    fetch_oracle_labels,
+    fetch_mpd_labels,
+    fetch_table_structure_by_mpd,
+    set_owner_for_mpd,
+    fetch_external_ods_relations,
+)
 
 # =========================
 # ÉTAT SESSION (confirmations utilisateur)
@@ -85,7 +92,7 @@ def load_model_features():
     )
 
 # =========================
-# UTILS : RELATIONS FACT-DIM
+# UTILS : RELATIONS FACT-DIM (même périmètre)
 # =========================
 def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=0.2):
     df = normalize_df(original_df)
@@ -106,7 +113,6 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
         all_cols = set()
         for c in candidate_name_cols:
             all_cols |= set(subset[c].dropna())
-        # Ajoute aussi les noms normalisés pour la recherche robuste
         all_cols_norm = set(_norm(col) for col in all_cols)
         return all_cols, all_cols_norm
 
@@ -120,7 +126,6 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
         fact_cols, fact_cols_norm = table_columns.get(fact, (set(), set()))
         for dim in dim_tables:
             dim_cols, dim_cols_norm = table_columns.get(dim, (set(), set()))
-            # Intersection brute de toutes les colonnes (pas seulement PK), en ignorant les colonnes à exclure
             common_cols = sorted([col for col in (fact_cols & dim_cols) if col not in EXCLUDE_COLS])
             if common_cols:
                 relations.append({
@@ -276,11 +281,103 @@ def preprocess_df(df):
 
     return grouped, df
 
+# =========================
+# LIENS FAIT vs ODS (externes)
+# =========================
+def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
+    """
+    Construit un dict: table -> (set_colnames, set_colnames_norm)
+    depuis le DataFrame source (MPD ou Excel).
+    """
+    df = normalize_df(original_df)
+    candidate_name_cols = []
+    for c in ['NOM_EPURE_DE_LA_RUBRIQUE', 'NOM_DE_LA_COLONNE_NORME_ADD', 'Nom', 'Code']:
+        if c in df.columns:
+            candidate_name_cols.append(c)
+    if not candidate_name_cols:
+        candidate_name_cols = ['NOM_EPURE_DE_LA_RUBRIQUE']
+    table_columns = {}
+    for t, sub in df.groupby('LIBELLE_DU_SEGMENT'):
+        all_cols = set()
+        for c in candidate_name_cols:
+            all_cols |= set(sub[c].dropna())
+        all_cols_norm = {_norm(col) for col in all_cols}
+        table_columns[t] = (all_cols, all_cols_norm)
+    return table_columns
 
+def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
+    """
+    Construit un dict: ods_table -> (set_colnames, set_colnames_norm)
+    à partir de fetch_external_ods_relations() : colonnes ODS_TABLE_NAME / ODS_COLUMN_NAME
+    """
+    df = ods_df.copy()
+    df['ODS_TABLE_NAME']  = df['ODS_TABLE_NAME'].map(_norm)
+    df['ODS_COLUMN_NAME'] = df['ODS_COLUMN_NAME'].map(_norm)
+    table_columns = {}
+    for t, sub in df.groupby('ODS_TABLE_NAME'):
+        cols = set(sub['ODS_COLUMN_NAME'].dropna())
+        table_columns[t] = (cols, cols)  # déjà normalisées
+    return table_columns
+
+def detect_fact_vs_ods_links(original_df: pd.DataFrame,
+                             type_predictions_df: pd.DataFrame,
+                             ods_df: pd.DataFrame,
+                             only_keylike: bool = False,
+                             min_common: int = 1,
+                             exclude_cols: set | None = None) -> pd.DataFrame:
+    """
+    Compare les tables FAIT (prédictions) avec toutes les tables ODS
+    et retourne les correspondances par colonnes communes.
+
+    - only_keylike=True : on restreint la comparaison aux colonnes qui ressemblent à des clés (RE_KEYS or RE_KEYS_RELATION)
+    - min_common : nombre minimum de colonnes communes pour garder la relation
+    - exclude_cols : set de colonnes à ignorer (appliqué aux deux côtés)
+    """
+    if exclude_cols is None:
+        exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
+
+    base_cols = _columns_by_table_from_original_df(original_df)
+    ods_cols  = _columns_by_table_from_ods_df(ods_df)
+
+    type_map = dict(zip(
+        type_predictions_df['Table_Name'].map(_norm),
+        type_predictions_df['Type Prédit']
+    ))
+    fact_tables = [t for t in base_cols.keys() if type_map.get(_norm(t)) == 'FAIT']
+
+    out = []
+    for fact in fact_tables:
+        fact_set_raw, fact_set_norm = base_cols.get(fact, (set(), set()))
+        if only_keylike:
+            fact_filtered = {c for c in fact_set_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+        else:
+            fact_filtered = fact_set_norm
+        fact_filtered = {c for c in fact_filtered if c not in exclude_cols}
+        if not fact_filtered:
+            continue
+
+        for ods_table, (ods_raw, ods_norm) in ods_cols.items():
+            ods_filtered = {c for c in ods_norm if c not in exclude_cols}
+            if only_keylike:
+                ods_filtered = {c for c in ods_filtered if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+            commons = sorted(fact_filtered & ods_filtered)
+            if len(commons) >= min_common:
+                out.append({
+                    'Table_Fact': fact,
+                    'ODS_Table': ods_table,
+                    'Colonnes_Communes': ', '.join(commons),
+                    'Nb_Colonnes_Communes': len(commons)
+                })
+
+    return pd.DataFrame(out)
+
+
+# =========================
+# UI
+# =========================
 st.title("Prédiction de type de table (FAIT ou DIMENSION)")
 
 st.write("Choisissez le mode de test :")
-# Utilisation d'un switch/toggle pour le choix du mode
 if 'mode' not in st.session_state:
     st.session_state.mode = "Sélectionner un MPD Oracle"
 
@@ -307,7 +404,7 @@ prob_diff_threshold = st.slider(
 grouped, original_df = None, None
 results, predictions, predictions_proba = None, None, None
 
-
+# --- Mode MPD Oracle ---
 if mode == "Sélectionner un MPD Oracle":
     st.header("Tester avec un MPD Oracle")
     mpd_labels = fetch_mpd_labels()
@@ -322,6 +419,7 @@ if mode == "Sélectionner un MPD Oracle":
         df_mpd = fetch_table_structure_by_mpd(selected_mpd, owner)
         grouped, original_df = preprocess_df(df_mpd)
 
+# --- Mode Excel ---
 elif mode == "Charger un fichier Excel":
     st.header("Tester avec un fichier Excel")
     uploaded_file = st.file_uploader("Charger un fichier Excel", type=["xlsx", "xls"])
@@ -357,12 +455,14 @@ if grouped is not None:
         'Confirmed': False
     })
 
+    # applique les corrections confirmées
     for table, typ in st.session_state.confirmed_types.items():
         mask = results['Table_Name'] == table
         if mask.any():
             results.loc[mask, 'Type Prédit'] = typ
             results.loc[mask, 'Confirmed'] = True
 
+    # vérité terrain si dispo
     if 'Table_Type' in grouped.columns:
         results['Vrai Type'] = grouped['Table_Type'].map({1: 'FAIT', 0: 'DIMENSION'})
 
@@ -375,21 +475,17 @@ if grouped is not None:
     st.subheader("Résultats des prédictions")
 
     def color_row(row):
-            # On récupère la valeur Confirmed depuis results
-            # Si la table est confirmée (expert ou auto), on affiche en vert
-            table_name = row['Table_Name'] if 'Table_Name' in row else None
-            if table_name is not None and 'Confirmed' in results.columns:
-                confirmed = results.loc[results['Table_Name'] == table_name, 'Confirmed'].values
-                if len(confirmed) > 0 and confirmed[0]:
-                    return ['background-color: #d4edda'] * len(row)
-            # Sinon, logique habituelle
-            diff = abs(row['Probabilité FACT'] - row['Probabilité DIMENSION'])
-            if diff >= prob_diff_threshold:
+        table_name = row['Table_Name'] if 'Table_Name' in row else None
+        if table_name is not None and 'Confirmed' in results.columns:
+            confirmed = results.loc[results['Table_Name'] == table_name, 'Confirmed'].values
+            if len(confirmed) > 0 and confirmed[0]:
                 return ['background-color: #d4edda'] * len(row)
-            else:
-                return ['background-color: #f8d7da'] * len(row)
+        diff = abs(row['Probabilité FACT'] - row['Probabilité DIMENSION'])
+        if diff >= prob_diff_threshold:
+            return ['background-color: #d4edda'] * len(row)
+        else:
+            return ['background-color: #f8d7da'] * len(row)
 
-    # On garde la colonne Confirmed pour la coloration
     results_display = results.copy().drop(columns=['Confirmed'])
     styled_results = results_display.style.apply(color_row, axis=1).format({
         'Probabilité FACT': '{:.3f}',
@@ -398,6 +494,7 @@ if grouped is not None:
     })
     st.dataframe(styled_results, use_container_width=True)
 
+    # --- Cas incertains ---
     if not incertains.empty:
         st.subheader("Cas incertains à valider par un expert")
         if mode == "Sélectionner un MPD Oracle":
@@ -472,7 +569,7 @@ if grouped is not None:
                     "Colonnes": st.column_config.TextColumn(
                         "Colonnes",
                         width="large",
-                        help="Aperçu des colonnes de la table (beaucoup plus complet, tronqué si >200)."
+                        help="Aperçu des colonnes de la table (tronqué si >200)."
                     ),
                     "Note": st.column_config.TextColumn(
                         "Note",
@@ -490,6 +587,7 @@ if grouped is not None:
     else:
         st.info("Aucun cas incertain à valider.")
 
+    # --- Précision locale si vérité dispo ---
     if 'Table_Type' in grouped.columns and not grouped['Table_Type'].isna().all():
         accuracy = accuracy_score(
             grouped['Table_Type'].map({1: 1, 0: 0}),
@@ -497,6 +595,7 @@ if grouped is not None:
         )
         st.write(f"**Précision sur la source sélectionnée :** {accuracy:.4f}")
 
+    # --- Relations FAIT↔DIM dans le même périmètre ---
     relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
     st.subheader("Relations détectées entre tables de faits et dimensions")
     if relations_df.empty:
@@ -504,33 +603,12 @@ if grouped is not None:
     else:
         st.dataframe(relations_df, use_container_width=True)
 
-    modifications_data = []
-    for table, typ in st.session_state.confirmed_types.items():
-        result_mask = results['Table_Name'] == table
-        if not result_mask.any():
-            continue
-        grouped_mask = grouped['Table_Name'] == table
-        if not grouped_mask.any():
-            continue
-        idx = grouped[grouped_mask].index[0]
-        original_prediction = 'FAIT' if predictions[idx] == 1 else 'DIMENSION'
-        if typ != original_prediction:
-            modifications_data.append({
-                'Table_Name': table,
-                'Type Initial': original_prediction,
-                'Type Corrigé': typ
-            })
-    modifications_df = pd.DataFrame(modifications_data)
-
-    # Export Excel : structure identique à la source + colonne de prédiction
+    # --- Export Excel (structure + prédiction) ---
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        # On part du DataFrame source original_df
         export_df = original_df.copy()
-        # Ajout de la colonne de prédiction
         type_map = dict(zip(results['Table_Name'].map(_norm), results['Type Prédit']))
         export_df['TYPE_DIMENSIONNEL_TABLE'] = export_df['LIBELLE_DU_SEGMENT'].map(type_map).fillna('UNKNOWN')
-        # On place la colonne de prédiction à la fin
         cols = [c for c in export_df.columns if c != 'TYPE_DIMENSIONNEL_TABLE'] + ['TYPE_DIMENSIONNEL_TABLE']
         export_df = export_df.loc[:, cols]
         export_df.to_excel(writer, index=False, sheet_name='Structure+Prédiction')
@@ -542,3 +620,48 @@ if grouped is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+    # --- NOUVELLE SECTION : Relations FAIT ↔ ODS (externes) ---
+    st.subheader("Relations FAIT ↔ ODS (externes)")
+    with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS"):
+        col1, col2, col3 = st.columns([1,1,2], gap="small")
+        with col1:
+            only_keylike = st.checkbox("Limiter aux colonnes type clé (CODE/ID/REF...)", value=True,
+                                       help="Si activé, on ne cherche les correspondances que sur des noms de colonnes ressemblant à des clés.")
+        with col2:
+            min_common = st.number_input("Nb min de colonnes communes", min_value=1, max_value=20, value=1, step=1)
+        with col3:
+            excl = st.text_input("Colonnes à exclure (séparées par des virgules)", "PERD_ARRT_INFO,CODE_ORGN_FINN")
+
+        run_ods = st.button("Lancer la recherche ODS")
+
+        if run_ods:
+            try:
+                ods_df = fetch_external_ods_relations()
+
+                exclude_cols = {_norm(x) for x in (excl.split(",") if excl else []) if x.strip()}
+                rel_ods = detect_fact_vs_ods_links(
+                    original_df=original_df,
+                    type_predictions_df=results,
+                    ods_df=ods_df,
+                    only_keylike=only_keylike,
+                    min_common=int(min_common),
+                    exclude_cols=exclude_cols if exclude_cols else None
+                )
+
+                if rel_ods.empty:
+                    st.info("Aucune correspondance trouvée entre vos tables de FAIT et les tables ODS selon les critères.")
+                else:
+                    st.success(f"{len(rel_ods)} correspondances trouvées.")
+                    st.dataframe(
+                        rel_ods.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
+                        use_container_width=True
+                    )
+                    csv = rel_ods.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "Télécharger les correspondances FAIT↔ODS (CSV)",
+                        data=csv,
+                        file_name="fact_vers_ods_correspondances.csv",
+                        mime="text/csv"
+                    )
+            except Exception as e:
+                st.error(f"Erreur lors de la recherche ODS : {e}")
