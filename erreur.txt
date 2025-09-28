@@ -551,4 +551,4 @@ if grouped is not None:
         file_name="structure_et_prediction.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
+Erreur lors de la recherche ODS : ORA-00920: invalid relational operator
