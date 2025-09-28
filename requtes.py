@@ -130,24 +130,36 @@ def fetch_table_structure_by_mpd(mpd_label, current_mpd_owner):
 
 def fetch_external_ods_relations():
     """
-    Récupère toutes les paires (table, colonne) pour le périmètre ODS côté dictionnaire MTDO.
-    On ne filtre pas par owner ici : on veut balayer tout ODS.
+    Récupère toutes les paires (table, colonne) ODS côté dictionnaire MTDO.
+    Version robuste pour éviter ORA-00920 via DB link : syntaxe de jointure "ancienne".
     """
     query = '''
-    SELECT 
-        t2.CODE_OBJT_TABL   AS ODS_TABLE_NAME,
-        t1.CODE_OBJT_COLN   AS ODS_COLUMN_NAME
-    FROM MTDO.MTDO_DICT_TABL_COLN@PSID11G t1
-    JOIN MTDO.MTDO_DICT_TABL@PSID11G      t2 
-      ON t1.IDNT_MODL      = t2.IDNT_MODL_TABL
-    WHERE t1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
-    ORDER BY t2.CODE_OBJT_TABL ASC
+    SELECT DISTINCT
+           t2.CODE_OBJT_TABL   AS ODS_TABLE_NAME,
+           t1.CODE_OBJT_COLN   AS ODS_COLUMN_NAME
+      FROM MTDO.MTDO_DICT_TABL_COLN@PSID11G t1,
+           MTDO.MTDO_DICT_TABL@PSID11G      t2
+     WHERE t1.IDNT_MODL = t2.IDNT_MODL_TABL
+       AND UPPER(t1.LIBL_CHMN_OBJT_MODL) LIKE '%ODS%'
+       AND t2.CODE_OBJT_TABL IS NOT NULL
+       AND t1.CODE_OBJT_COLN IS NOT NULL
+     ORDER BY t2.CODE_OBJT_TABL
     '''
     connection = get_oracle_connection()
-    cursor = connection.cursor()
-    cursor.execute(query)
-    columns = [desc[0] for desc in cursor.description]
-    rows = cursor.fetchall()
-    cursor.close()
-    connection.close()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            connection.close()
+        except Exception:
+            pass
     return pd.DataFrame(rows, columns=columns)
+
+
