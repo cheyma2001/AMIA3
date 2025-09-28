@@ -284,10 +284,14 @@ def preprocess_df(df):
 # =========================
 # LIENS FAIT vs ODS (externes)
 # =========================
+# ---- CHANGÉ : helpers qui renvoient aussi norm2raw pour ré-afficher les colonnes brutes
 def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
     """
-    Construit un dict: table -> (set_colnames, set_colnames_norm)
-    depuis le DataFrame source (MPD ou Excel).
+    Retourne: table -> {
+        'raw': set[str],            # colonnes brutes trouvées
+        'norm': set[str],           # colonnes normalisées
+        'norm2raw': dict[str,str],  # mapping "NOM_NORMALISE" -> "Nom Brut Vu"
+    }
     """
     df = normalize_df(original_df)
     candidate_name_cols = []
@@ -296,29 +300,48 @@ def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
             candidate_name_cols.append(c)
     if not candidate_name_cols:
         candidate_name_cols = ['NOM_EPURE_DE_LA_RUBRIQUE']
+
     table_columns = {}
     for t, sub in df.groupby('LIBELLE_DU_SEGMENT'):
-        all_cols = set()
+        raw_set = set()
         for c in candidate_name_cols:
-            all_cols |= set(sub[c].dropna())
-        all_cols_norm = {_norm(col) for col in all_cols}
-        table_columns[t] = (all_cols, all_cols_norm)
+            raw_set |= set(sub[c].dropna())
+        norm_set = {_norm(col) for col in raw_set}
+
+        norm2raw = {}
+        for col in raw_set:
+            n = _norm(col)
+            if n not in norm2raw:
+                norm2raw[n] = col  # garder la 1re variante brute rencontrée
+
+        table_columns[t] = {
+            'raw': raw_set,
+            'norm': norm_set,
+            'norm2raw': norm2raw
+        }
     return table_columns
 
 def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
     """
-    Construit un dict: ods_table -> (set_colnames, set_colnames_norm)
-    à partir de fetch_external_ods_relations() : colonnes ODS_TABLE_NAME / ODS_COLUMN_NAME
+    Retourne: ods_table -> { 'raw', 'norm', 'norm2raw' } (ici raw==norm car déjà upper)
     """
     df = ods_df.copy()
     df['ODS_TABLE_NAME']  = df['ODS_TABLE_NAME'].map(_norm)
     df['ODS_COLUMN_NAME'] = df['ODS_COLUMN_NAME'].map(_norm)
+
     table_columns = {}
     for t, sub in df.groupby('ODS_TABLE_NAME'):
-        cols = set(sub['ODS_COLUMN_NAME'].dropna())
-        table_columns[t] = (cols, cols)  # déjà normalisées
+        raw_set = set(sub['ODS_COLUMN_NAME'].dropna())
+        norm_set = set(raw_set)  # déjà normalisé
+        norm2raw = {c: c for c in raw_set}
+        table_columns[t] = {
+            'raw': raw_set,
+            'norm': norm_set,
+            'norm2raw': norm2raw
+        }
     return table_columns
 
+# ---- CHANGÉ : renvoie aussi Colonnes_Fact et Colonnes_ODS (libellés bruts)
 def detect_fact_vs_ods_links(original_df: pd.DataFrame,
                              type_predictions_df: pd.DataFrame,
                              ods_df: pd.DataFrame,
@@ -332,6 +355,14 @@ def detect_fact_vs_ods_links(original_df: pd.DataFrame,
     - only_keylike=True : on restreint la comparaison aux colonnes qui ressemblent à des clés (RE_KEYS or RE_KEYS_RELATION)
     - min_common : nombre minimum de colonnes communes pour garder la relation
     - exclude_cols : set de colonnes à ignorer (appliqué aux deux côtés)
+
+    Champs retournés:
+      - Table_Fact
+      - ODS_Table
+      - Colonnes_Communes (noms normalisés communs)
+      - Nb_Colonnes_Communes
+      - Colonnes_Fact (libellés bruts côté table de fait)
+      - Colonnes_ODS  (libellés bruts côté ODS)
     """
     if exclude_cols is None:
         exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
@@ -347,30 +378,40 @@ def detect_fact_vs_ods_links(original_df: pd.DataFrame,
 
     out = []
     for fact in fact_tables:
-        fact_set_raw, fact_set_norm = base_cols.get(fact, (set(), set()))
+        info_fact = base_cols.get(fact, {'raw': set(), 'norm': set(), 'norm2raw': {}})
+        fact_norm = info_fact['norm']
+
+        # filtrage (keys-only et exclusions)
         if only_keylike:
-            fact_filtered = {c for c in fact_set_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+            fact_filtered = {c for c in fact_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
         else:
-            fact_filtered = fact_set_norm
+            fact_filtered = set(fact_norm)
         fact_filtered = {c for c in fact_filtered if c not in exclude_cols}
         if not fact_filtered:
             continue
 
-        for ods_table, (ods_raw, ods_norm) in ods_cols.items():
+        for ods_table, info_ods in ods_cols.items():
+            ods_norm = info_ods['norm']
             ods_filtered = {c for c in ods_norm if c not in exclude_cols}
             if only_keylike:
                 ods_filtered = {c for c in ods_filtered if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+
             commons = sorted(fact_filtered & ods_filtered)
             if len(commons) >= min_common:
+                # Re-projeter les colonnes communes en libellés bruts côté FAIT/ODS
+                fact_raw_cols = [info_fact['norm2raw'].get(c, c) for c in commons]
+                ods_raw_cols  = [info_ods['norm2raw'].get(c, c) for c in commons]
+
                 out.append({
                     'Table_Fact': fact,
                     'ODS_Table': ods_table,
                     'Colonnes_Communes': ', '.join(commons),
-                    'Nb_Colonnes_Communes': len(commons)
+                    'Nb_Colonnes_Communes': len(commons),
+                    'Colonnes_Fact': ', '.join(fact_raw_cols),
+                    'Colonnes_ODS': ', '.join(ods_raw_cols),
                 })
 
     return pd.DataFrame(out)
-
 
 # =========================
 # UI
@@ -620,7 +661,7 @@ if grouped is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # --- NOUVELLE SECTION : Relations FAIT ↔ ODS (externes) ---
+    # --- NOUVELLE SECTION : Relations FAIT ↔ ODS (externes)
     st.subheader("Relations FAIT ↔ ODS (externes)")
     with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS"):
         col1, col2, col3 = st.columns([1,1,2], gap="small")
@@ -652,8 +693,15 @@ if grouped is not None:
                     st.info("Aucune correspondance trouvée entre vos tables de FAIT et les tables ODS selon les critères.")
                 else:
                     st.success(f"{len(rel_ods)} correspondances trouvées.")
+                    # ordre d'affichage lisible
+                    cols_order = [
+                        'Table_Fact', 'ODS_Table',
+                        'Nb_Colonnes_Communes', 'Colonnes_Communes',
+                        'Colonnes_Fact', 'Colonnes_ODS'
+                    ]
+                    display_df = rel_ods.loc[:, [c for c in cols_order if c in rel_ods.columns]]
                     st.dataframe(
-                        rel_ods.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
+                        display_df.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
                         use_container_width=True
                     )
                     csv = rel_ods.to_csv(index=False).encode('utf-8')
