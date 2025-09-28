@@ -284,7 +284,6 @@ def preprocess_df(df):
 # =========================
 # LIENS FAIT vs ODS (externes)
 # =========================
-# ---- CHANGÉ : helpers qui renvoient aussi norm2raw pour ré-afficher les colonnes brutes
 def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
     """
     Retourne: table -> {
@@ -341,7 +340,6 @@ def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
         }
     return table_columns
 
-# ---- CHANGÉ : renvoie aussi Colonnes_Fact et Colonnes_ODS (libellés bruts)
 def detect_fact_vs_ods_links(original_df: pd.DataFrame,
                              type_predictions_df: pd.DataFrame,
                              ods_df: pd.DataFrame,
@@ -352,17 +350,13 @@ def detect_fact_vs_ods_links(original_df: pd.DataFrame,
     Compare les tables FAIT (prédictions) avec toutes les tables ODS
     et retourne les correspondances par colonnes communes.
 
-    - only_keylike=True : on restreint la comparaison aux colonnes qui ressemblent à des clés (RE_KEYS or RE_KEYS_RELATION)
-    - min_common : nombre minimum de colonnes communes pour garder la relation
-    - exclude_cols : set de colonnes à ignorer (appliqué aux deux côtés)
-
     Champs retournés:
       - Table_Fact
       - ODS_Table
       - Colonnes_Communes (noms normalisés communs)
       - Nb_Colonnes_Communes
       - Colonnes_Fact (libellés bruts côté table de fait)
-      - Colonnes_ODS  (libellés bruts côté ODS)
+      - ODS_Colonnes  (libellés bruts côté ODS)
     """
     if exclude_cols is None:
         exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
@@ -408,7 +402,7 @@ def detect_fact_vs_ods_links(original_df: pd.DataFrame,
                     'Colonnes_Communes': ', '.join(commons),
                     'Nb_Colonnes_Communes': len(commons),
                     'Colonnes_Fact': ', '.join(fact_raw_cols),
-                    'Colonnes_ODS': ', '.join(ods_raw_cols),
+                    'ODS_Colonnes': ', '.join(ods_raw_cols),
                 })
 
     return pd.DataFrame(out)
@@ -636,14 +630,6 @@ if grouped is not None:
         )
         st.write(f"**Précision sur la source sélectionnée :** {accuracy:.4f}")
 
-    # --- Relations FAIT↔DIM dans le même périmètre ---
-    relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
-    st.subheader("Relations détectées entre tables de faits et dimensions")
-    if relations_df.empty:
-        st.info("Aucune relation détectée.")
-    else:
-        st.dataframe(relations_df, use_container_width=True)
-
     # --- Export Excel (structure + prédiction) ---
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -661,55 +647,130 @@ if grouped is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # --- NOUVELLE SECTION : Relations FAIT ↔ ODS (externes)
-    st.subheader("Relations FAIT ↔ ODS (externes)")
-    with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS"):
-        col1, col2, col3 = st.columns([1,1,2], gap="small")
-        with col1:
-            only_keylike = st.checkbox("Limiter aux colonnes type clé (CODE/ID/REF...)", value=True,
-                                       help="Si activé, on ne cherche les correspondances que sur des noms de colonnes ressemblant à des clés.")
-        with col2:
-            min_common = st.number_input("Nb min de colonnes communes", min_value=1, max_value=20, value=1, step=1)
-        with col3:
-            excl = st.text_input("Colonnes à exclure (séparées par des virgules)", "PERD_ARRT_INFO,CODE_ORGN_FINN")
+    # --- Relations (FAIT↔DIM + FAIT↔ODS) dans une SEULE section
+    st.subheader("Relations détectées")
+    rel_sections = st.tabs(["FAIT ↔ DIM (local)", "FAIT ↔ ODS (externes)", "Vue unifiée"])
 
-        run_ods = st.button("Lancer la recherche ODS")
+    # 1) FAIT ↔ DIM (inchangé)
+    with rel_sections[0]:
+        relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
+        if relations_df.empty:
+            st.info("Aucune relation FAIT ↔ DIM détectée.")
+        else:
+            st.dataframe(relations_df, use_container_width=True)
 
-        if run_ods:
-            try:
-                ods_df = fetch_external_ods_relations()
+    # 2) FAIT ↔ ODS (avec ODS_Table + ODS_Colonnes)
+    with rel_sections[1]:
+        with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS", expanded=True):
+            c1, c2, c3 = st.columns([1,1,2], gap="small")
+            with c1:
+                only_keylike = st.checkbox("Limiter aux colonnes type clé (CODE/ID/REF...)", value=True)
+            with c2:
+                min_common = st.number_input("Nb min de colonnes communes", min_value=1, max_value=20, value=1, step=1)
+            with c3:
+                excl = st.text_input("Colonnes à exclure (séparées par des virgules)", "PERD_ARRT_INFO,CODE_ORGN_FINN")
 
-                exclude_cols = {_norm(x) for x in (excl.split(",") if excl else []) if x.strip()}
-                rel_ods = detect_fact_vs_ods_links(
-                    original_df=original_df,
-                    type_predictions_df=results,
-                    ods_df=ods_df,
-                    only_keylike=only_keylike,
-                    min_common=int(min_common),
-                    exclude_cols=exclude_cols if exclude_cols else None
-                )
-
-                if rel_ods.empty:
-                    st.info("Aucune correspondance trouvée entre vos tables de FAIT et les tables ODS selon les critères.")
-                else:
-                    st.success(f"{len(rel_ods)} correspondances trouvées.")
-                    # ordre d'affichage lisible
-                    cols_order = [
-                        'Table_Fact', 'ODS_Table',
-                        'Nb_Colonnes_Communes', 'Colonnes_Communes',
-                        'Colonnes_Fact', 'Colonnes_ODS'
-                    ]
-                    display_df = rel_ods.loc[:, [c for c in cols_order if c in rel_ods.columns]]
-                    st.dataframe(
-                        display_df.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
-                        use_container_width=True
+            run_ods = st.button("Lancer la recherche ODS")
+            if run_ods:
+                try:
+                    ods_df = fetch_external_ods_relations()
+                    exclude_cols = {_norm(x) for x in (excl.split(",") if excl else []) if x.strip()}
+                    rel_ods = detect_fact_vs_ods_links(
+                        original_df=original_df,
+                        type_predictions_df=results,
+                        ods_df=ods_df,
+                        only_keylike=only_keylike,
+                        min_common=int(min_common),
+                        exclude_cols=exclude_cols if exclude_cols else None
                     )
-                    csv = rel_ods.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "Télécharger les correspondances FAIT↔ODS (CSV)",
-                        data=csv,
-                        file_name="fact_vers_ods_correspondances.csv",
-                        mime="text/csv"
-                    )
-            except Exception as e:
-                st.error(f"Erreur lors de la recherche ODS : {e}")
+                    if rel_ods.empty:
+                        st.info("Aucune relation FAIT ↔ ODS trouvée.")
+                    else:
+                        st.success(f"{len(rel_ods)} correspondances trouvées.")
+                        cols_order = [
+                            'Table_Fact', 'ODS_Table',
+                            'Nb_Colonnes_Communes', 'Colonnes_Communes',
+                            'Colonnes_Fact', 'ODS_Colonnes'
+                        ]
+                        display_df = rel_ods.loc[:, [c for c in cols_order if c in rel_ods.columns]]
+                        st.dataframe(
+                            display_df.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
+                            use_container_width=True
+                        )
+                        csv = rel_ods.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            "Télécharger FAIT↔ODS (CSV)",
+                            data=csv,
+                            file_name="fact_vers_ods_correspondances.csv",
+                            mime="text/csv"
+                        )
+                except Exception as e:
+                    st.error(f"Erreur ODS : {e}")
+
+    # 3) Vue unifiée (FAIT↔DIM + FAIT↔ODS)
+    with rel_sections[2]:
+        # on réutilise relations_df s'il existe, sinon on le recalcule
+        try:
+            _ = relations_df
+        except NameError:
+            relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
+
+        # récupérer rel_ods si calculé dans l’onglet précédent
+        rel_ods_ready = 'rel_ods' in locals() and isinstance(rel_ods, pd.DataFrame)
+        if not rel_ods_ready:
+            st.info("Pour inclure l'ODS dans la vue unifiée, lance d'abord la recherche ODS dans l'onglet précédent.")
+            rel_ods = pd.DataFrame(columns=[
+                'Table_Fact','ODS_Table','Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
+            ])
+
+        # Harmoniser schémas : ajouter les colonnes ODS à FAIT↔DIM (vides)
+        if relations_df.empty:
+            rel_dim_aligned = pd.DataFrame(columns=[
+                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
+                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
+            ])
+        else:
+            rel_dim_aligned = relations_df.copy()
+            rel_dim_aligned['Relation_Type'] = 'FAIT↔DIM'
+            rel_dim_aligned['ODS_Table'] = ''
+            rel_dim_aligned['Colonnes_Fact'] = ''
+            rel_dim_aligned['ODS_Colonnes'] = ''
+            if 'Table_Dimension' not in rel_dim_aligned.columns:
+                rel_dim_aligned['Table_Dimension'] = ''
+            cols_dim = [
+                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
+                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
+            ]
+            rel_dim_aligned = rel_dim_aligned.reindex(columns=cols_dim, fill_value='')
+
+        # Harmoniser FAIT↔ODS : ajouter Table_Dimension (vide) + Relation_Type
+        if rel_ods.empty:
+            rel_ods_aligned = pd.DataFrame(columns=rel_dim_aligned.columns)
+        else:
+            rel_ods_aligned = rel_ods.copy()
+            rel_ods_aligned['Relation_Type'] = 'FAIT↔ODS'
+            rel_ods_aligned['Table_Dimension'] = ''
+            cols_ods = [
+                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
+                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
+            ]
+            rel_ods_aligned = rel_ods_aligned.reindex(columns=cols_ods, fill_value='')
+
+        # Concat & affichage
+        unified = pd.concat([rel_dim_aligned, rel_ods_aligned], ignore_index=True)
+        if unified.empty:
+            st.info("Aucune relation à afficher pour la vue unifiée.")
+        else:
+            st.dataframe(
+                unified.sort_values(
+                    ['Relation_Type','Table_Fact','Nb_Colonnes_Communes'],
+                    ascending=[True, True, False]
+                ),
+                use_container_width=True
+            )
+            st.download_button(
+                "Télécharger toutes les relations (CSV)",
+                data=unified.to_csv(index=False).encode('utf-8'),
+                file_name="relations_fait_dim_ods.csv",
+                mime="text/csv"
+            )
