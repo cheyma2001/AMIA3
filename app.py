@@ -6,17 +6,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from xgboost import XGBClassifier
-from sentence_transformers import SentenceTransformer  # si besoin plus tard
+from sentence_transformers import SentenceTransformer
 from sklearn.metrics import accuracy_score
 import xgboost, sklearn
-
-from requtes import (
-    fetch_oracle_labels,
-    fetch_mpd_labels,
-    fetch_table_structure_by_mpd,
-    set_owner_for_mpd,
-    fetch_external_ods_relations,
-)
+from oracle import fetch_oracle_labels,fetch_mpd_labels,fetch_table_structure_by_mpd, set_owner_for_mpd
 
 # =========================
 # ÉTAT SESSION (confirmations utilisateur)
@@ -92,7 +85,7 @@ def load_model_features():
     )
 
 # =========================
-# UTILS : RELATIONS FACT-DIM (même périmètre)
+# UTILS : RELATIONS FACT-DIM
 # =========================
 def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=0.2):
     df = normalize_df(original_df)
@@ -108,15 +101,17 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
         candidate_name_cols = ['NOM_EPURE_DE_LA_RUBRIQUE']
     all_tables = df['LIBELLE_DU_SEGMENT'].unique()
 
-    def cols_for_table(t):
+    def cols_for_table_key_relation(t):
         subset = df[df['LIBELLE_DU_SEGMENT'] == t]
-        all_cols = set()
+        key_cols = set()
         for c in candidate_name_cols:
-            all_cols |= set(subset[c].dropna())
-        all_cols_norm = set(_norm(col) for col in all_cols)
-        return all_cols, all_cols_norm
+            key_cols |= set(
+                col for col in subset[c].dropna() if RE_KEYS_RELATION.search(str(col))
+            )
+        key_cols_norm = set(_norm(col) for col in key_cols)
+        return key_cols, key_cols_norm
 
-    table_columns = {t: cols_for_table(t) for t in all_tables}
+    table_columns = {t: cols_for_table_key_relation(t) for t in all_tables}
     fact_tables = [t for t in all_tables if type_map.get(_norm(t)) == 'FAIT']
     dim_tables  = [t for t in all_tables if type_map.get(_norm(t)) == 'DIMENSION']
 
@@ -126,6 +121,7 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
         fact_cols, fact_cols_norm = table_columns.get(fact, (set(), set()))
         for dim in dim_tables:
             dim_cols, dim_cols_norm = table_columns.get(dim, (set(), set()))
+            # Intersection des colonnes clés relationnelles, hors colonnes à exclure
             common_cols = sorted([col for col in (fact_cols & dim_cols) if col not in EXCLUDE_COLS])
             if common_cols:
                 relations.append({
@@ -171,52 +167,52 @@ def preprocess_excel_file(file):
             'PK'
         ]
         missing = [c for c in required_columns if c not in df.columns]
-        if missing:
-            st.error(f"Colonnes manquantes: {missing}")
-            return None, None
+        with rel_sections[1]:
+            with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS", expanded=True):
+                c1, c2, c3 = st.columns([1,1,2], gap="small")
+                with c1:
+                    only_keylike = st.checkbox("Limiter aux colonnes type clé (CODE/ID/REF...)", value=True, key="ods_keylike")
+                with c2:
+                    min_common = st.number_input("Nb min de colonnes communes", min_value=1, max_value=20, value=1, step=1, key="ods_min_common")
+                with c3:
+                    excl = st.text_input("Colonnes à exclure (séparées par des virgules)", "PERD_ARRT_INFO,CODE_ORGN_FINN", key="ods_excl")
 
-        agg_dict = {
-            'NOM_EPURE_DE_LA_RUBRIQUE': ['count', lambda x: [str(v).upper() for v in x.fillna('')]],
-            'TYPE_DONNEES_COLONNE': lambda x: (
-                sum(1 for t in x if RE_NUMERIC.search(str(t))),
-                sum(1 for t in x if RE_TEXT.search(str(t))),
-                sum(1 for t in x if RE_DATE.search(str(t)))
-            ),
-            'PK': lambda x: sum(1 for p in x if str(p).strip().upper() == 'O')
-        }
-
-        has_table_type = 'Table_Type' in df.columns
-        if has_table_type:
-            agg_dict['Table_Type'] = 'first'
-
-        grouped = df.groupby('LIBELLE_DU_SEGMENT').agg(agg_dict).reset_index()
-
-        expected_cols = ['Table_Name', 'Num_Columns', 'Column_Names', 'Type_Counts', 'Num_PKs']
-        if has_table_type:
-            expected_cols.append('Table_Type')
-        grouped.columns = expected_cols
-
-        grouped['Num_Columns'] = grouped['Num_Columns'].fillna(0).replace(0, 1)
-        grouped['Num_Numeric'] = grouped['Type_Counts'].apply(lambda x: x[0]).fillna(0)
-        grouped['Num_Text']    = grouped['Type_Counts'].apply(lambda x: x[1]).fillna(0)
-        grouped['Num_Date']    = grouped['Type_Counts'].apply(lambda x: x[2]).fillna(0)
-        grouped['Num_PKs']     = grouped['Num_PKs'].fillna(0).astype(int)
-
-        grouped['Pct_Numeric'] = grouped['Num_Numeric'] / grouped['Num_Columns']
-        grouped['Pct_Text']    = grouped['Num_Text']    / grouped['Num_Columns']
-        grouped['Pct_Date']    = grouped['Num_Date']    / grouped['Num_Columns']
-        grouped['PK_Ratio']    = grouped['Num_PKs']     / grouped['Num_Columns']
-
-        grouped['Has_Code_Prefix']    = grouped['Table_Name'].apply(has_code_prefix)
-        grouped['Has_Measure_Prefix'] = grouped['Table_Name'].apply(has_measure_prefix)
-
-        grouped['Num_Key_Like']     = grouped['Column_Names'].apply(count_key_like_columns)
-        grouped['Num_Measure_Like'] = grouped['Column_Names'].apply(count_measure_like_columns)
-
-        grouped = grouped.drop(columns=['Type_Counts'])
-        grouped = grouped.fillna(0)
-
-        return grouped, df
+                run_ods = st.button("Lancer la recherche ODS", key="ods_run")
+                if run_ods:
+                    try:
+                        ods_df = fetch_external_ods_relations()
+                        exclude_cols = {_norm(x) for x in (excl.split(",") if excl else []) if x.strip()}
+                        rel_ods = detect_fact_vs_ods_links(
+                            original_df=original_df,
+                            type_predictions_df=results,
+                            ods_df=ods_df,
+                            only_keylike=only_keylike,
+                            min_common=int(min_common),
+                            exclude_cols=exclude_cols if exclude_cols else None
+                        )
+                        if rel_ods.empty:
+                            st.info("Aucune relation FAIT ↔ ODS trouvée.")
+                        else:
+                            st.success(f"{len(rel_ods)} correspondances trouvées.")
+                            cols_order = [
+                                'Table_Fact', 'ODS_Table',
+                                'Nb_Colonnes_Communes', 'Colonnes_Communes',
+            
+                            ]
+                            display_df = rel_ods.loc[:, [c for c in cols_order if c in rel_ods.columns]]
+                            st.dataframe(
+                                display_df.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
+                                use_container_width=True
+                            )
+                            csv = rel_ods.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                "Télécharger FAIT↔ODS (CSV)",
+                                data=csv,
+                                file_name="fact_vers_ods_correspondances.csv",
+                                mime="text/csv"
+                            )
+                    except Exception as e:
+                        st.error(f"Erreur ODS : {e}")
 
     except Exception as e:
         st.error(f"Erreur lors du traitement du fichier Excel : {str(e)}")
@@ -281,138 +277,11 @@ def preprocess_df(df):
 
     return grouped, df
 
-# =========================
-# LIENS FAIT vs ODS (externes)
-# =========================
-def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
-    """
-    Retourne: table -> {
-        'raw': set[str],            # colonnes brutes trouvées
-        'norm': set[str],           # colonnes normalisées
-        'norm2raw': dict[str,str],  # mapping "NOM_NORMALISE" -> "Nom Brut Vu"
-    }
-    """
-    df = normalize_df(original_df)
-    candidate_name_cols = []
-    for c in ['NOM_EPURE_DE_LA_RUBRIQUE', 'NOM_DE_LA_COLONNE_NORME_ADD', 'Nom', 'Code']:
-        if c in df.columns:
-            candidate_name_cols.append(c)
-    if not candidate_name_cols:
-        candidate_name_cols = ['NOM_EPURE_DE_LA_RUBRIQUE']
 
-    table_columns = {}
-    for t, sub in df.groupby('LIBELLE_DU_SEGMENT'):
-        raw_set = set()
-        for c in candidate_name_cols:
-            raw_set |= set(sub[c].dropna())
-        norm_set = {_norm(col) for col in raw_set}
-
-        norm2raw = {}
-        for col in raw_set:
-            n = _norm(col)
-            if n not in norm2raw:
-                norm2raw[n] = col  # garder la 1re variante brute rencontrée
-
-        table_columns[t] = {
-            'raw': raw_set,
-            'norm': norm_set,
-            'norm2raw': norm2raw
-        }
-    return table_columns
-
-def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
-    """
-    Retourne: ods_table -> { 'raw', 'norm', 'norm2raw' } (ici raw==norm car déjà upper)
-    """
-    df = ods_df.copy()
-    df['ODS_TABLE_NAME']  = df['ODS_TABLE_NAME'].map(_norm)
-    df['ODS_COLUMN_NAME'] = df['ODS_COLUMN_NAME'].map(_norm)
-
-    table_columns = {}
-    for t, sub in df.groupby('ODS_TABLE_NAME'):
-        raw_set = set(sub['ODS_COLUMN_NAME'].dropna())
-        norm_set = set(raw_set)  # déjà normalisé
-        norm2raw = {c: c for c in raw_set}
-        table_columns[t] = {
-            'raw': raw_set,
-            'norm': norm_set,
-            'norm2raw': norm2raw
-        }
-    return table_columns
-
-def detect_fact_vs_ods_links(original_df: pd.DataFrame,
-                             type_predictions_df: pd.DataFrame,
-                             ods_df: pd.DataFrame,
-                             only_keylike: bool = False,
-                             min_common: int = 1,
-                             exclude_cols: set | None = None) -> pd.DataFrame:
-    """
-    Compare les tables FAIT (prédictions) avec toutes les tables ODS
-    et retourne les correspondances par colonnes communes.
-
-    Champs retournés:
-      - Table_Fact
-      - ODS_Table
-      - Colonnes_Communes (noms normalisés communs)
-      - Nb_Colonnes_Communes
-      - Colonnes_Fact (libellés bruts côté table de fait)
-      - ODS_Colonnes  (libellés bruts côté ODS)
-    """
-    if exclude_cols is None:
-        exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
-
-    base_cols = _columns_by_table_from_original_df(original_df)
-    ods_cols  = _columns_by_table_from_ods_df(ods_df)
-
-    type_map = dict(zip(
-        type_predictions_df['Table_Name'].map(_norm),
-        type_predictions_df['Type Prédit']
-    ))
-    fact_tables = [t for t in base_cols.keys() if type_map.get(_norm(t)) == 'FAIT']
-
-    out = []
-    for fact in fact_tables:
-        info_fact = base_cols.get(fact, {'raw': set(), 'norm': set(), 'norm2raw': {}})
-        fact_norm = info_fact['norm']
-
-        # filtrage (keys-only et exclusions)
-        if only_keylike:
-            fact_filtered = {c for c in fact_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
-        else:
-            fact_filtered = set(fact_norm)
-        fact_filtered = {c for c in fact_filtered if c not in exclude_cols}
-        if not fact_filtered:
-            continue
-
-        for ods_table, info_ods in ods_cols.items():
-            ods_norm = info_ods['norm']
-            ods_filtered = {c for c in ods_norm if c not in exclude_cols}
-            if only_keylike:
-                ods_filtered = {c for c in ods_filtered if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
-
-            commons = sorted(fact_filtered & ods_filtered)
-            if len(commons) >= min_common:
-                # Re-projeter les colonnes communes en libellés bruts côté FAIT/ODS
-                fact_raw_cols = [info_fact['norm2raw'].get(c, c) for c in commons]
-                ods_raw_cols  = [info_ods['norm2raw'].get(c, c) for c in commons]
-
-                out.append({
-                    'Table_Fact': fact,
-                    'ODS_Table': ods_table,
-                    'Colonnes_Communes': ', '.join(commons),
-                    'Nb_Colonnes_Communes': len(commons),
-                    'Colonnes_Fact': ', '.join(fact_raw_cols),
-                    'ODS_Colonnes': ', '.join(ods_raw_cols),
-                })
-
-    return pd.DataFrame(out)
-
-# =========================
-# UI
-# =========================
 st.title("Prédiction de type de table (FAIT ou DIMENSION)")
 
 st.write("Choisissez le mode de test :")
+# Utilisation d'un switch/toggle pour le choix du mode
 if 'mode' not in st.session_state:
     st.session_state.mode = "Sélectionner un MPD Oracle"
 
@@ -439,7 +308,7 @@ prob_diff_threshold = st.slider(
 grouped, original_df = None, None
 results, predictions, predictions_proba = None, None, None
 
-# --- Mode MPD Oracle ---
+
 if mode == "Sélectionner un MPD Oracle":
     st.header("Tester avec un MPD Oracle")
     mpd_labels = fetch_mpd_labels()
@@ -454,7 +323,6 @@ if mode == "Sélectionner un MPD Oracle":
         df_mpd = fetch_table_structure_by_mpd(selected_mpd, owner)
         grouped, original_df = preprocess_df(df_mpd)
 
-# --- Mode Excel ---
 elif mode == "Charger un fichier Excel":
     st.header("Tester avec un fichier Excel")
     uploaded_file = st.file_uploader("Charger un fichier Excel", type=["xlsx", "xls"])
@@ -490,14 +358,12 @@ if grouped is not None:
         'Confirmed': False
     })
 
-    # applique les corrections confirmées
     for table, typ in st.session_state.confirmed_types.items():
         mask = results['Table_Name'] == table
         if mask.any():
             results.loc[mask, 'Type Prédit'] = typ
             results.loc[mask, 'Confirmed'] = True
 
-    # vérité terrain si dispo
     if 'Table_Type' in grouped.columns:
         results['Vrai Type'] = grouped['Table_Type'].map({1: 'FAIT', 0: 'DIMENSION'})
 
@@ -510,17 +376,21 @@ if grouped is not None:
     st.subheader("Résultats des prédictions")
 
     def color_row(row):
-        table_name = row['Table_Name'] if 'Table_Name' in row else None
-        if table_name is not None and 'Confirmed' in results.columns:
-            confirmed = results.loc[results['Table_Name'] == table_name, 'Confirmed'].values
-            if len(confirmed) > 0 and confirmed[0]:
+            # On récupère la valeur Confirmed depuis results
+            # Si la table est confirmée (expert ou auto), on affiche en vert
+            table_name = row['Table_Name'] if 'Table_Name' in row else None
+            if table_name is not None and 'Confirmed' in results.columns:
+                confirmed = results.loc[results['Table_Name'] == table_name, 'Confirmed'].values
+                if len(confirmed) > 0 and confirmed[0]:
+                    return ['background-color: #d4edda'] * len(row)
+            # Sinon, logique habituelle
+            diff = abs(row['Probabilité FACT'] - row['Probabilité DIMENSION'])
+            if diff >= prob_diff_threshold:
                 return ['background-color: #d4edda'] * len(row)
-        diff = abs(row['Probabilité FACT'] - row['Probabilité DIMENSION'])
-        if diff >= prob_diff_threshold:
-            return ['background-color: #d4edda'] * len(row)
-        else:
-            return ['background-color: #f8d7da'] * len(row)
+            else:
+                return ['background-color: #f8d7da'] * len(row)
 
+    # On garde la colonne Confirmed pour la coloration
     results_display = results.copy().drop(columns=['Confirmed'])
     styled_results = results_display.style.apply(color_row, axis=1).format({
         'Probabilité FACT': '{:.3f}',
@@ -529,7 +399,6 @@ if grouped is not None:
     })
     st.dataframe(styled_results, use_container_width=True)
 
-    # --- Cas incertains ---
     if not incertains.empty:
         st.subheader("Cas incertains à valider par un expert")
         if mode == "Sélectionner un MPD Oracle":
@@ -604,7 +473,7 @@ if grouped is not None:
                     "Colonnes": st.column_config.TextColumn(
                         "Colonnes",
                         width="large",
-                        help="Aperçu des colonnes de la table (tronqué si >200)."
+                        help="Aperçu des colonnes de la table (beaucoup plus complet, tronqué si >200)."
                     ),
                     "Note": st.column_config.TextColumn(
                         "Note",
@@ -622,7 +491,6 @@ if grouped is not None:
     else:
         st.info("Aucun cas incertain à valider.")
 
-    # --- Précision locale si vérité dispo ---
     if 'Table_Type' in grouped.columns and not grouped['Table_Type'].isna().all():
         accuracy = accuracy_score(
             grouped['Table_Type'].map({1: 1, 0: 0}),
@@ -630,12 +498,153 @@ if grouped is not None:
         )
         st.write(f"**Précision sur la source sélectionnée :** {accuracy:.4f}")
 
-    # --- Export Excel (structure + prédiction) ---
+    relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
+    st.subheader("Relations détectées entre tables de faits et dimensions")
+    if relations_df.empty:
+
+        st.info("Aucune relation détectée.")
+    else:
+        # Fusion des vérifications dans le même tableau
+        def check_keys_in_fact_dim(original_df, relations_df):
+            results = []
+            df = normalize_df(original_df)
+            for _, rel in relations_df.iterrows():
+                fact = rel['Table_Fact']
+                dim = rel['Table_Dimension']
+                # Colonnes de la dimension
+                dim_cols = df[df['LIBELLE_DU_SEGMENT'] == dim]['NOM_EPURE_DE_LA_RUBRIQUE'].dropna().map(_norm).tolist()
+                # Colonnes de la table de fait
+                fact_cols = df[df['LIBELLE_DU_SEGMENT'] == fact]['NOM_EPURE_DE_LA_RUBRIQUE'].dropna().map(_norm).tolist()
+                # Clés relationnelles attendues
+                keys_relation = [c for c in dim_cols if RE_KEYS_RELATION.search(c)]
+                missing_keys_relation = [c for c in keys_relation if c not in fact_cols]
+                # Clés primaires de la dimension
+                pk_dim = df[(df['LIBELLE_DU_SEGMENT'] == dim) & (df['PK'].map(_norm) == 'O')]['NOM_EPURE_DE_LA_RUBRIQUE'].dropna().map(_norm).tolist()
+                missing_pk_dim = [c for c in pk_dim if c not in fact_cols]
+                results.append({
+                    'Clés relationnelles manquantes': ', '.join(missing_keys_relation) if missing_keys_relation else 'Aucune',
+                    'PK de la dimension manquantes': ', '.join(missing_pk_dim) if missing_pk_dim else 'Aucune'
+                })
+            return results
+
+        # Ajout des colonnes de vérification au DataFrame des relations
+        verif_cols = check_keys_in_fact_dim(original_df, relations_df)
+        relations_df_ext = relations_df.copy()
+        relations_df_ext['Clés relationnelles manquantes'] = [v['Clés relationnelles manquantes'] for v in verif_cols]
+        relations_df_ext['PK de la dimension manquantes'] = [v['PK de la dimension manquantes'] for v in verif_cols]
+        # st.subheader("Relations détectées entre tables de faits et dimensions (avec vérification des clés)")
+        st.dataframe(relations_df_ext, use_container_width=True)
+
+    # =========================
+    # Correspondances FAIT ↔ ODS
+    # =========================
+    from oracle import fetch_external_ods_relations
+    ods_df = fetch_external_ods_relations()
+
+    def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
+        df = original_df.copy()
+        df['LIBELLE_DU_SEGMENT'] = df['LIBELLE_DU_SEGMENT'].map(_norm)
+        df['NOM_EPURE_DE_LA_RUBRIQUE'] = df['NOM_EPURE_DE_LA_RUBRIQUE'].map(_norm)
+        table_columns = {}
+        for t, sub in df.groupby('LIBELLE_DU_SEGMENT'):
+            raw_set = set(sub['NOM_EPURE_DE_LA_RUBRIQUE'].dropna())
+            norm_set = set(raw_set)
+            norm2raw = {c: c for c in raw_set}
+            table_columns[t] = {
+                'raw': raw_set,
+                'norm': norm_set,
+                'norm2raw': norm2raw
+            }
+        return table_columns
+
+    def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
+        df = ods_df.copy()
+        df['ODS_TABLE_NAME']  = df['ODS_TABLE_NAME'].map(_norm)
+        df['ODS_COLUMN_NAME'] = df['ODS_COLUMN_NAME'].map(_norm)
+        table_columns = {}
+        for t, sub in df.groupby('ODS_TABLE_NAME'):
+            raw_set = set(sub['ODS_COLUMN_NAME'].dropna())
+            norm_set = set(raw_set)
+            norm2raw = {c: c for c in raw_set}
+            table_columns[t] = {
+                'raw': raw_set,
+                'norm': norm_set,
+                'norm2raw': norm2raw
+            }
+        return table_columns
+
+    def detect_fact_vs_ods_links(original_df, type_predictions_df, ods_df, only_keylike=False, min_common=1, exclude_cols=None):
+        if exclude_cols is None:
+            exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
+        base_cols = _columns_by_table_from_original_df(original_df)
+        ods_cols  = _columns_by_table_from_ods_df(ods_df)
+        type_map = dict(zip(
+            type_predictions_df['Table_Name'].map(_norm),
+            type_predictions_df['Type Prédit']
+        ))
+        fact_tables = [t for t in base_cols.keys() if type_map.get(_norm(t)) == 'FAIT']
+        out = []
+        for fact in fact_tables:
+            info_fact = base_cols.get(fact, {'raw': set(), 'norm': set(), 'norm2raw': {}})
+            fact_norm = info_fact['norm']
+            # Toujours filtrer sur les colonnes clés côté FAIT
+            fact_filtered = {c for c in fact_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+            fact_filtered = {c for c in fact_filtered if c not in exclude_cols}
+            if not fact_filtered:
+                continue
+            for ods_table, info_ods in ods_cols.items():
+                ods_norm = info_ods['norm']
+                # Toujours filtrer sur les colonnes clés côté ODS
+                ods_filtered = {c for c in ods_norm if (RE_KEYS.search(c) or RE_KEYS_RELATION.search(c))}
+                ods_filtered = {c for c in ods_filtered if c not in exclude_cols}
+                commons = sorted(fact_filtered & ods_filtered)
+                if len(commons) >= min_common:
+                    fact_raw_cols = [info_fact['norm2raw'].get(c, c) for c in commons]
+                    ods_raw_cols  = [info_ods['norm2raw'].get(c, c) for c in commons]
+                    out.append({
+                        'Table_Fact': fact,
+                        'ODS_Table': ods_table,
+                        'Colonnes_Communes': ', '.join(commons),
+                        'Nb_Colonnes_Communes': len(commons),
+                        'Colonnes_Fact': ', '.join(fact_raw_cols),
+                        'ODS_Colonnes': ', '.join(ods_raw_cols),
+                    })
+        return pd.DataFrame(out)
+
+    ods_links_df = detect_fact_vs_ods_links(original_df, results, ods_df)
+    st.subheader("Correspondances entre tables de faits et ODS")
+    if ods_links_df.empty:
+        st.info("Aucune correspondance FAIT↔ODS détectée.")
+    else:
+        st.dataframe(ods_links_df, use_container_width=True)
+
+    modifications_data = []
+    for table, typ in st.session_state.confirmed_types.items():
+        result_mask = results['Table_Name'] == table
+        if not result_mask.any():
+            continue
+        grouped_mask = grouped['Table_Name'] == table
+        if not grouped_mask.any():
+            continue
+        idx = grouped[grouped_mask].index[0]
+        original_prediction = 'FAIT' if predictions[idx] == 1 else 'DIMENSION'
+        if typ != original_prediction:
+            modifications_data.append({
+                'Table_Name': table,
+                'Type Initial': original_prediction,
+                'Type Corrigé': typ
+            })
+    modifications_df = pd.DataFrame(modifications_data)
+
+    # Export Excel : structure identique à la source + colonne de prédiction
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # On part du DataFrame source original_df
         export_df = original_df.copy()
+        # Ajout de la colonne de prédiction
         type_map = dict(zip(results['Table_Name'].map(_norm), results['Type Prédit']))
         export_df['TYPE_DIMENSIONNEL_TABLE'] = export_df['LIBELLE_DU_SEGMENT'].map(type_map).fillna('UNKNOWN')
+        # On place la colonne de prédiction à la fin
         cols = [c for c in export_df.columns if c != 'TYPE_DIMENSIONNEL_TABLE'] + ['TYPE_DIMENSIONNEL_TABLE']
         export_df = export_df.loc[:, cols]
         export_df.to_excel(writer, index=False, sheet_name='Structure+Prédiction')
@@ -647,130 +656,3 @@ if grouped is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # --- Relations (FAIT↔DIM + FAIT↔ODS) dans une SEULE section
-    st.subheader("Relations détectées")
-    rel_sections = st.tabs(["FAIT ↔ DIM (local)", "FAIT ↔ ODS (externes)", "Vue unifiée"])
-
-    # 1) FAIT ↔ DIM (inchangé)
-    with rel_sections[0]:
-        relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
-        if relations_df.empty:
-            st.info("Aucune relation FAIT ↔ DIM détectée.")
-        else:
-            st.dataframe(relations_df, use_container_width=True)
-
-    # 2) FAIT ↔ ODS (avec ODS_Table + ODS_Colonnes)
-    with rel_sections[1]:
-        with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS", expanded=True):
-            c1, c2, c3 = st.columns([1,1,2], gap="small")
-            with c1:
-                only_keylike = st.checkbox("Limiter aux colonnes type clé (CODE/ID/REF...)", value=True)
-            with c2:
-                min_common = st.number_input("Nb min de colonnes communes", min_value=1, max_value=20, value=1, step=1)
-            with c3:
-                excl = st.text_input("Colonnes à exclure (séparées par des virgules)", "PERD_ARRT_INFO,CODE_ORGN_FINN")
-
-            run_ods = st.button("Lancer la recherche ODS")
-            if run_ods:
-                try:
-                    ods_df = fetch_external_ods_relations()
-                    exclude_cols = {_norm(x) for x in (excl.split(",") if excl else []) if x.strip()}
-                    rel_ods = detect_fact_vs_ods_links(
-                        original_df=original_df,
-                        type_predictions_df=results,
-                        ods_df=ods_df,
-                        only_keylike=only_keylike,
-                        min_common=int(min_common),
-                        exclude_cols=exclude_cols if exclude_cols else None
-                    )
-                    if rel_ods.empty:
-                        st.info("Aucune relation FAIT ↔ ODS trouvée.")
-                    else:
-                        st.success(f"{len(rel_ods)} correspondances trouvées.")
-                        cols_order = [
-                            'Table_Fact', 'ODS_Table',
-                            'Nb_Colonnes_Communes', 'Colonnes_Communes',
-                            'Colonnes_Fact', 'ODS_Colonnes'
-                        ]
-                        display_df = rel_ods.loc[:, [c for c in cols_order if c in rel_ods.columns]]
-                        st.dataframe(
-                            display_df.sort_values(['Table_Fact', 'Nb_Colonnes_Communes'], ascending=[True, False]),
-                            use_container_width=True
-                        )
-                        csv = rel_ods.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            "Télécharger FAIT↔ODS (CSV)",
-                            data=csv,
-                            file_name="fact_vers_ods_correspondances.csv",
-                            mime="text/csv"
-                        )
-                except Exception as e:
-                    st.error(f"Erreur ODS : {e}")
-
-    # 3) Vue unifiée (FAIT↔DIM + FAIT↔ODS)
-    with rel_sections[2]:
-        # on réutilise relations_df s'il existe, sinon on le recalcule
-        try:
-            _ = relations_df
-        except NameError:
-            relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
-
-        # récupérer rel_ods si calculé dans l’onglet précédent
-        rel_ods_ready = 'rel_ods' in locals() and isinstance(rel_ods, pd.DataFrame)
-        if not rel_ods_ready:
-            st.info("Pour inclure l'ODS dans la vue unifiée, lance d'abord la recherche ODS dans l'onglet précédent.")
-            rel_ods = pd.DataFrame(columns=[
-                'Table_Fact','ODS_Table','Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
-            ])
-
-        # Harmoniser schémas : ajouter les colonnes ODS à FAIT↔DIM (vides)
-        if relations_df.empty:
-            rel_dim_aligned = pd.DataFrame(columns=[
-                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
-                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
-            ])
-        else:
-            rel_dim_aligned = relations_df.copy()
-            rel_dim_aligned['Relation_Type'] = 'FAIT↔DIM'
-            rel_dim_aligned['ODS_Table'] = ''
-            rel_dim_aligned['Colonnes_Fact'] = ''
-            rel_dim_aligned['ODS_Colonnes'] = ''
-            if 'Table_Dimension' not in rel_dim_aligned.columns:
-                rel_dim_aligned['Table_Dimension'] = ''
-            cols_dim = [
-                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
-                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
-            ]
-            rel_dim_aligned = rel_dim_aligned.reindex(columns=cols_dim, fill_value='')
-
-        # Harmoniser FAIT↔ODS : ajouter Table_Dimension (vide) + Relation_Type
-        if rel_ods.empty:
-            rel_ods_aligned = pd.DataFrame(columns=rel_dim_aligned.columns)
-        else:
-            rel_ods_aligned = rel_ods.copy()
-            rel_ods_aligned['Relation_Type'] = 'FAIT↔ODS'
-            rel_ods_aligned['Table_Dimension'] = ''
-            cols_ods = [
-                'Relation_Type','Table_Fact','Table_Dimension','ODS_Table',
-                'Nb_Colonnes_Communes','Colonnes_Communes','Colonnes_Fact','ODS_Colonnes'
-            ]
-            rel_ods_aligned = rel_ods_aligned.reindex(columns=cols_ods, fill_value='')
-
-        # Concat & affichage
-        unified = pd.concat([rel_dim_aligned, rel_ods_aligned], ignore_index=True)
-        if unified.empty:
-            st.info("Aucune relation à afficher pour la vue unifiée.")
-        else:
-            st.dataframe(
-                unified.sort_values(
-                    ['Relation_Type','Table_Fact','Nb_Colonnes_Communes'],
-                    ascending=[True, True, False]
-                ),
-                use_container_width=True
-            )
-            st.download_button(
-                "Télécharger toutes les relations (CSV)",
-                data=unified.to_csv(index=False).encode('utf-8'),
-                file_name="relations_fait_dim_ods.csv",
-                mime="text/csv"
-            )
