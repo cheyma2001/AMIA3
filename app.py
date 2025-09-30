@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from xgboost import XGBClassifier
-from sentence_transformers import SentenceTransformer  # si besoin plus tard
+from sentence_transformers import SentenceTransformer  
 from sklearn.metrics import accuracy_score
 import xgboost, sklearn
 
@@ -15,36 +15,33 @@ from oracle import (
     fetch_mpd_labels,
     fetch_table_structure_by_mpd,
     set_owner_for_mpd,
-    fetch_external_ods_relations,  # <- nécessaire pour le bouton ODS
+    fetch_external_ods_relations,  
 )
 
 # =========================
-# ÉTAT SESSION (confirmations utilisateur + ODS)
+# ÉTAT SESSION
 # =========================
 if "temp_confirmed_types" not in st.session_state:
     st.session_state.temp_confirmed_types = {}
 if "confirmed_types" not in st.session_state:
     st.session_state.confirmed_types = {}
-# Mémoire des résultats ODS (pour éviter de relancer au moindre rerun Streamlit)
 if "ods_relations" not in st.session_state:
     st.session_state.ods_relations = None
 if "ods_params" not in st.session_state:
     st.session_state.ods_params = {}
 
 # =========================
-# REGEX (IDENTIQUES AU TRAINING + filtre strict ODS)
+# REGEX 
 # =========================
 RE_NUMERIC = re.compile(r'NUMBER\(\d+(,\d+)?\)|INTEGER|DECIMAL|FLOAT|NUMERIC|BIGINT', re.I)
 RE_TEXT    = re.compile(r'CHAR\(\d+\)|VARCHAR2\(\d+\)|VARCHAR|TEXT|STRING', re.I)
 RE_DATE    = re.compile(r'DATE|TIMESTAMP|TIME', re.I)
 RE_KEYS    = re.compile(r'ID|CODE|NUM|KEY|REF|LIBL', re.I)
-RE_KEYS_RELATION = re.compile(r'CODE|TYPE|CODE TYPE', re.I)
+RE_KEYS_RELATION = re.compile(r'CODE|TYPE|CODE TYPE|REFR', re.I)
 RE_MEAS    = re.compile(r'MONTANT|AMOUNT|VALEUR|VALUE|PRICE|PRIX|QTE|QTY|COUNT|TOTAL|SUM|MT_|SOLD_|VALR_', re.I)
 RE_CODE_PREFIX = re.compile(r'^CODE_|^TYPE_', re.I)
 RE_FACT_PREFIX = re.compile(r'FACT|MESURE|FLUX|TRANSACTION|EVNM|MVT_|ECRT_|BALN_', re.I)
-
-# Filtre STRICT pour la recherche FAIT↔ODS : CODE_* / TYPE_* / "CODE TYPE"
-RE_CODETYPE_STRICT = re.compile(r'^(?:CODE_|TYPE_)|\bCODE[_\s]+TYPE\b', re.I)
+RE_CODETYPE_STRICT = re.compile(r'^(?:CODE_|TYPE_|REFR_)|\bCODE[_\s]+TYPE\b', re.I)
 
 # =========================
 # HELPERS de normalisation
@@ -100,8 +97,8 @@ def load_model_features():
     )
 
 # =========================
-# UTILS : RELATIONS FACT-DIM (même périmètre)
-# =========================
+# UTILS : RELATIONS FACT-DIM 
+# ==========================
 def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=0.2):
     df = normalize_df(original_df)
     type_map = dict(zip(
@@ -128,7 +125,7 @@ def detect_fact_dim_links(original_df, type_predictions_df, prob_diff_threshold=
     fact_tables = [t for t in all_tables if type_map.get(_norm(t)) == 'FAIT']
     dim_tables  = [t for t in all_tables if type_map.get(_norm(t)) == 'DIMENSION']
 
-    EXCLUDE_COLS = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
+    EXCLUDE_COLS = {"PERD_ARRT_INFO", "CODE_ORGN_FINN", "CODE_ORGN_FINN_BPCE"}
     relations = []
     for fact in fact_tables:
         fact_cols, _ = table_columns.get(fact, (set(), set()))
@@ -160,7 +157,7 @@ def count_measure_like_columns(column_names):
     return sum(1 for c in column_names if RE_MEAS.search(str(c)))
 
 # =========================
-# PRÉTRAITEMENT EXCEL (aligné sur training + normalisation)
+# PRÉTRAITEMENT EXCEL 
 # =========================
 def preprocess_excel_file(file):
     """
@@ -290,11 +287,11 @@ def preprocess_df(df):
     return grouped, df
 
 # =========================
-# LIENS FAIT vs ODS (externes) — helpers + moteur
+# LIENS FAIT vs ODS 
 # =========================
 def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
     """
-    Retourne: table -> {'raw', 'norm', 'norm2raw'}
+    Retourne: table 
     """
     df = normalize_df(original_df)
     candidate_name_cols = []
@@ -314,13 +311,13 @@ def _columns_by_table_from_original_df(original_df: pd.DataFrame) -> dict:
         for col in raw_set:
             n = _norm(col)
             if n not in norm2raw:
-                norm2raw[n] = col  # 1re variante brute rencontrée
+                norm2raw[n] = col
         table_columns[t] = {'raw': raw_set, 'norm': norm_set, 'norm2raw': norm2raw}
     return table_columns
 
 def _columns_by_table_from_ods_df(ods_df: pd.DataFrame) -> dict:
     """
-    Retourne: ods_table -> {'raw', 'norm', 'norm2raw'} (ici raw == norm, déjà upper)
+    Retourne: ods_table 
     """
     df = ods_df.copy()
     df['ODS_TABLE_NAME']  = df['ODS_TABLE_NAME'].map(_norm)
@@ -340,66 +337,84 @@ def detect_fact_vs_ods_links(original_df: pd.DataFrame,
                              only_keylike: bool = False,
                              min_common: int = 1,
                              exclude_cols: set | None = None) -> pd.DataFrame:
-    """
-    Compare les tables FAIT (prédictions) avec toutes les tables ODS
-    et retourne:
-      - Table_Fact
-      - ODS_Table
-      - Colonnes_Communes (noms normalisés communs)
-      - Nb_Colonnes_Communes
-      - Colonnes_Fact (noms bruts côté table de fait)
-      - ODS_Colonnes  (noms bruts côté ODS)
-
-    ⚠ Filtrage strict (si only_keylike=True) : ne garde QUE CODE_* / TYPE_* / "CODE TYPE".
-    """
-    if exclude_cols is None:
-        exclude_cols = {"PERD_ARRT_INFO", "CODE_ORGN_FINN"}
-
-    base_cols = _columns_by_table_from_original_df(original_df)
-    ods_cols  = _columns_by_table_from_ods_df(ods_df)
-
+    # Correction : reconstituer fact_tables à partir des prédictions
+    df = normalize_df(original_df)
     type_map = dict(zip(
         type_predictions_df['Table_Name'].map(_norm),
         type_predictions_df['Type Prédit']
     ))
-    fact_tables = [t for t in base_cols.keys() if type_map.get(_norm(t)) == 'FAIT']
+    all_tables = df['LIBELLE_DU_SEGMENT'].unique()
+    fact_tables = [t for t in all_tables if type_map.get(_norm(t)) == 'FAIT']
+
+    base_cols = _columns_by_table_from_original_df(original_df)
+    ods_cols  = _columns_by_table_from_ods_df(ods_df)
+
+    # Vérifier si la colonne 'Modele' existe dans ods_df
+    has_modele = 'Modele' in ods_df.columns
 
     out = []
     for fact in fact_tables:
-        info_fact = base_cols.get(fact, {'raw': set(), 'norm': set(), 'norm2raw': {}})
-        fact_norm = info_fact['norm']
+        # Chercher les PK de la table de fait
+        df_fact = original_df[original_df['LIBELLE_DU_SEGMENT'].map(_norm) == _norm(fact)]
+        pk_cols = df_fact[df_fact['PK'].map(_norm) == 'O']['NOM_EPURE_DE_LA_RUBRIQUE'].dropna().map(_norm).tolist()
+        pk_cols = [c for c in pk_cols if c not in exclude_cols]
+        if not pk_cols:
+            continue
 
-        # --- Filtrage strict + exclusions
-        if only_keylike:
-            fact_filtered = {c for c in fact_norm if RE_CODETYPE_STRICT.search(c)}
-        else:
-            fact_filtered = set(fact_norm)
-        fact_filtered = {c for c in fact_filtered if c not in exclude_cols}
-        if not fact_filtered:
+        for ods_table, info_ods in ods_cols.items():
+            # Ignorer si le nom de la table de fait et de la table ODS est identique (après normalisation)
+            if _norm(fact) == _norm(ods_table):
+                continue
+            ods_norm = info_ods['norm']
+            ods_filtered = {c for c in ods_norm if c not in exclude_cols}
+            # On ne garde que les ODS qui contiennent toutes les PK de la table de fait
+            if set(pk_cols).issubset(ods_filtered):
+                fact_raw_cols = [c for c in pk_cols]
+                ods_raw_cols  = [info_ods['norm2raw'].get(c, c) for c in pk_cols]
+                row = {
+                    'Table_Fact': fact,
+                    'ODS_Table': ods_table,
+                    'Colonnes_PK_Fact': ', '.join(pk_cols),
+                    'Colonnes_Communes': ', '.join(pk_cols),
+                    'ODS_Colonnes': ', '.join(ods_raw_cols),
+                }
+              
+                if has_modele:
+                   
+                    modele_val = ods_df[ods_df['ODS_TABLE_NAME'].map(_norm) == _norm(ods_table)]['Modele']
+                    row['Modele'] = modele_val.iloc[0] if not modele_val.empty else ''
+                out.append(row)
+    df_out = pd.DataFrame(out)
+    if not df_out.empty:
+        # Supprimer les doublons exacts sur toutes les colonnes principales
+        df_out = df_out.drop_duplicates(subset=[
+            'Table_Fact', 'ODS_Table', 'Colonnes_PK_Fact', 'Colonnes_Communes', 'ODS_Colonnes'
+        ])
+    return df_out
+    out = []
+    for fact in fact_tables:
+        # Chercher les PK de la table de fait
+        df_fact = original_df[original_df['LIBELLE_DU_SEGMENT'].map(_norm) == _norm(fact)]
+        pk_cols = df_fact[df_fact['PK'].map(_norm) == 'O']['NOM_EPURE_DE_LA_RUBRIQUE'].dropna().map(_norm).tolist()
+        pk_cols = [c for c in pk_cols if c not in exclude_cols]
+        if not pk_cols:
             continue
 
         for ods_table, info_ods in ods_cols.items():
             ods_norm = info_ods['norm']
-            if only_keylike:
-                ods_filtered = {c for c in ods_norm if RE_CODETYPE_STRICT.search(c)}
-            else:
-                ods_filtered = set(ods_norm)
-            ods_filtered = {c for c in ods_filtered if c not in exclude_cols}
-
-            commons = sorted(fact_filtered & ods_filtered)
+            ods_filtered = {c for c in ods_norm if c not in exclude_cols}
+            commons = sorted(set(pk_cols) & ods_filtered)
             if len(commons) >= min_common:
-                fact_raw_cols = [info_fact['norm2raw'].get(c, c) for c in commons]
+                fact_raw_cols = [c for c in pk_cols if c in commons]
                 ods_raw_cols  = [info_ods['norm2raw'].get(c, c) for c in commons]
-
                 out.append({
                     'Table_Fact': fact,
                     'ODS_Table': ods_table,
+                    'Colonnes_PK_Fact': ', '.join(pk_cols),
                     'Colonnes_Communes': ', '.join(commons),
                     'Nb_Colonnes_Communes': len(commons),
-                    'Colonnes_Fact': ', '.join(fact_raw_cols),
                     'ODS_Colonnes': ', '.join(ods_raw_cols),
                 })
-
     return pd.DataFrame(out)
 
 # =========================
@@ -434,7 +449,7 @@ prob_diff_threshold = st.slider(
 grouped, original_df = None, None
 results, predictions, predictions_proba = None, None, None
 
-# --- Mode MPD Oracle ---
+
 if mode == "Sélectionner un MPD Oracle":
     st.header("Tester avec un MPD Oracle")
     mpd_labels = fetch_mpd_labels()
@@ -449,14 +464,14 @@ if mode == "Sélectionner un MPD Oracle":
         df_mpd = fetch_table_structure_by_mpd(selected_mpd, owner)
         grouped, original_df = preprocess_df(df_mpd)
 
-# --- Mode Excel ---
+
 elif mode == "Charger un fichier Excel":
     st.header("Tester avec un fichier Excel")
     uploaded_file = st.file_uploader("Charger un fichier Excel", type=["xlsx", "xls"])
     if uploaded_file:
         grouped, original_df = preprocess_excel_file(uploaded_file)
 
-# === TRAITEMENT ET AFFICHAGE COMMUN ===
+
 if grouped is not None:
     if grouped['Table_Name'].duplicated().any():
         st.warning("Attention : Certains noms de tables sont dupliqués.")
@@ -485,18 +500,16 @@ if grouped is not None:
         'Confirmed': False
     })
 
-    # Applique les corrections confirmées
+  
     for table, typ in st.session_state.confirmed_types.items():
         mask = results['Table_Name'] == table
         if mask.any():
             results.loc[mask, 'Type Prédit'] = typ
             results.loc[mask, 'Confirmed'] = True
 
-    # Vérité terrain si dispo
     if 'Table_Type' in grouped.columns:
         results['Vrai Type'] = grouped['Table_Type'].map({1: 'FAIT', 0: 'DIMENSION'})
 
-    # Cas incertains
     incertains_mask = (
         (np.abs(results['Probabilité FACT'] - results['Probabilité DIMENSION']) < prob_diff_threshold)
         & (~results['Confirmed'])
@@ -600,7 +613,6 @@ if grouped is not None:
     else:
         st.info("Aucun cas incertain à valider.")
 
-    # --- Précision locale si vérité dispo ---
     if 'Table_Type' in grouped.columns and not grouped['Table_Type'].isna().all():
         accuracy = accuracy_score(
             grouped['Table_Type'].map({1: 1, 0: 0}),
@@ -608,13 +620,12 @@ if grouped is not None:
         )
         st.write(f"**Précision sur la source sélectionnée :** {accuracy:.4f}")
 
-    # --- Relations FAIT↔DIM (local) ---
+    # --- Relations FAIT↔DIM  ---
     relations_df = detect_fact_dim_links(original_df, results, prob_diff_threshold=prob_diff_threshold)
     st.subheader("Relations détectées entre tables de faits et dimensions")
     if relations_df.empty:
         st.info("Aucune relation détectée.")
     else:
-        # Vérifications complémentaires (clés relationnelles attendues & PK dim manquantes dans la table de fait)
         def check_keys_in_fact_dim(original_df, relations_df):
             out = []
             df = normalize_df(original_df)
@@ -641,32 +652,20 @@ if grouped is not None:
             st.dataframe(relations_df_ext, use_container_width=True)
 
     # =========================
-    # Relations FAIT ↔ ODS (au clic)
+    # Relations FAIT ↔ ODS 
     # =========================
-    st.subheader("Relations FAIT ↔ ODS (externes)")
+    st.subheader("Relations FAIT ↔ ODS")
 
     with st.expander("Chercher les colonnes communes entre vos FAITS et toutes les tables ODS", expanded=True):
-        c1, c2, c3, c4 = st.columns([1,1,2,1], gap="small")
 
+        c1, c2 = st.columns([2,1], gap="small")
         with c1:
-            only_keylike = st.checkbox(
-                "Filtre strict CODE_/TYPE_",
-                value=True,
-                key="ods_only_keylike",
-                help="Si activé, on ne garde que les colonnes commençant par CODE_ ou TYPE_, ou contenant 'CODE TYPE'."
-            )
-        with c2:
-            min_common = st.number_input(
-                "Nb min de colonnes communes",
-                min_value=1, max_value=20, value=1, step=1, key="ods_min_common"
-            )
-        with c3:
             excl = st.text_input(
                 "Colonnes à exclure (séparées par des virgules)",
-                value="PERD_ARRT_INFO,CODE_ORGN_FINN",
+                value="PERD_ARRT_INFO,CODE_ORGN_FINN,CODE_ORGN_FINN_BPCE",
                 key="ods_excl"
             )
-        with c4:
+        with c2:
             run_ods = st.button("Lancer la recherche ODS", type="primary", key="btn_run_ods")
             reset_ods = st.button("Réinitialiser", key="btn_reset_ods")
 
@@ -684,15 +683,11 @@ if grouped is not None:
                     original_df=original_df,
                     type_predictions_df=results,
                     ods_df=ods_df,
-                    only_keylike=only_keylike,
-                    min_common=int(min_common),
                     exclude_cols=exclude_cols if exclude_cols else None
                 )
 
                 st.session_state.ods_relations = rel_ods
                 st.session_state.ods_params = dict(
-                    only_keylike=only_keylike,
-                    min_common=int(min_common),
                     exclude_cols=",".join(sorted(exclude_cols)) if exclude_cols else ""
                 )
 
@@ -701,26 +696,28 @@ if grouped is not None:
             except Exception as e:
                 st.error(f"Erreur lors de la recherche ODS : {e}")
 
-    # Affichage des résultats mémorisés (si dispos)
+    # Affichage des résultats mémorisés 
     if st.session_state.ods_relations is None or st.session_state.ods_relations.empty:
         st.info("Aucun résultat ODS à afficher. Utilise le bouton **Lancer la recherche ODS**.")
     else:
         cols_order = [
             "Table_Fact", "ODS_Table",
-            "Nb_Colonnes_Communes", "Colonnes_Communes",
-            "Colonnes_Fact", "ODS_Colonnes"
+            "Colonnes_PK_Fact", "Colonnes_Communes", "ODS_Colonnes"
         ]
         display_df = st.session_state.ods_relations.loc[:, [c for c in cols_order if c in st.session_state.ods_relations.columns]]
         st.dataframe(
-            display_df.sort_values(["Table_Fact", "Nb_Colonnes_Communes"], ascending=[True, False]),
+            display_df.sort_values(["Table_Fact"], ascending=[True]),
             use_container_width=True
         )
-        csv = st.session_state.ods_relations.to_csv(index=False).encode("utf-8")
+        output_ods = io.BytesIO()
+        with pd.ExcelWriter(output_ods, engine='xlsxwriter') as writer:
+            display_df.to_excel(writer, index=False, sheet_name='FAIT_ODS')
+        output_ods.seek(0)
         st.download_button(
-            "Télécharger FAIT↔ODS (CSV)",
-            data=csv,
-            file_name="fact_vers_ods_correspondances.csv",
-            mime="text/csv"
+            "Télécharger FAIT↔ODS (Excel)",
+            data=output_ods,
+            file_name="fact_vers_ods_correspondances.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
     # --- Export Excel (structure + prédiction) ---
