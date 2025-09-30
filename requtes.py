@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_oracle_connection():
-   
     oracledb.init_oracle_client()
     dsn = os.getenv('ORACLE_DSN')
     return oracledb.connect(dsn=dsn)
@@ -43,10 +42,6 @@ def fetch_mpd_labels():
 _CURRENT_MPD_OWNER = None
 
 def set_owner_for_mpd(mpd_label):
-    """
-    Récupère et stocke le owner associé au MPD sélectionné.
-    On prend le min(owner) retourné (façon simple pour fixer un owner principal).
-    """
     global _CURRENT_MPD_OWNER
     connection = get_oracle_connection()
     cursor = connection.cursor()
@@ -68,10 +63,6 @@ def set_owner_for_mpd(mpd_label):
     return _CURRENT_MPD_OWNER
 
 def fetch_table_structure_by_mpd(mpd_label, current_mpd_owner):
-    """
-    Récupère la structure (colonnes + PK) des tables du MPD (via dictionnaire MTDO) 
-    pour l'owner détecté, au format attendu par l'app (LIBELLE_DU_SEGMENT, ... , PK).
-    """
     connection = get_oracle_connection()
     cursor = connection.cursor()
     query = f"""
@@ -130,21 +121,22 @@ def fetch_table_structure_by_mpd(mpd_label, current_mpd_owner):
 
 def fetch_external_ods_relations():
     """
-    Récupère toutes les paires (table, colonne) ODS côté dictionnaire MTDO.
-    Version robuste pour éviter ORA-00920 via DB link : syntaxe de jointure "ancienne".
+    Récupère toutes les paires (table, colonne) ODS côté dictionnaire MTDO,
+    AVEC le modèle d’appartenance.
     """
     query = """
         SELECT 
             t2.CODE_OBJT_TABL   AS ODS_TABLE_NAME,
-            t1.CODE_OBJT_COLN   AS ODS_COLUMN_NAME
-            
+            t1.CODE_OBJT_COLN   AS ODS_COLUMN_NAME,
+            mpd.LIBL_OBJT_MODL  AS Modele
         FROM MTDO.MTDO_DICT_TABL_COLN@PSID11G t1
         JOIN MTDO.MTDO_DICT_TABL@PSID11G      t2 
-          ON t1.IDNT_MODL      = t2.IDNT_MODL_TABL
-         AND t1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
-         AND t1.CODE_OBJT_TABL=t2.CODE_OBJT_TABL
+          ON t1.CODE_OBJT_TABL = t2.CODE_OBJT_TABL
+        JOIN MTDO.MTDO_DICT_MODL@PSID11G      mpd
+          ON t2.IDNT_MODL_TABL = mpd.IDNT_OBJT_MODL
+        WHERE t1.LIBL_CHMN_OBJT_MODL LIKE '%ODS%'
         ORDER BY t2.CODE_OBJT_TABL ASC
-        """
+    """
     connection = get_oracle_connection()
     try:
         cursor = connection.cursor()
